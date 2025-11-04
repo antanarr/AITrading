@@ -38,3 +38,41 @@ struct DLCard<Content: View>: View {
     }
 }
 
+// Shimmer loading effect
+struct Shimmer: ViewModifier {
+    @State private var phase: CGFloat = 0
+    var duration: Double = 1.5
+    
+    func body(content: Content) -> some View {
+        content
+            .overlay(
+                GeometryReader { geometry in
+                    LinearGradient(
+                        colors: [
+                            Color.clear,
+                            Color.white.opacity(0.3),
+                            Color.clear
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+                    .frame(width: geometry.size.width * 2)
+                    .offset(x: -geometry.size.width + (geometry.size.width * 2 * phase))
+                }
+                .allowsHitTesting(false)
+            )
+            .mask(content)
+            .onAppear {
+                withAnimation(.linear(duration: duration).repeatForever(autoreverses: false)) {
+                    phase = 1.0
+                }
+            }
+    }
+}
+
+extension View {
+    func shimmer() -> some View {
+        modifier(Shimmer())
+    }
+}
+

@@ -9,6 +9,7 @@ struct DreamDetailView: View {
     @State private var deepReadMessage: String? = nil
     @State private var generatedPDFURL: URL? = nil
     @State private var hasShownInterpretation = false
+    @State private var isInterpreting: Bool = false
     private let oracle = OracleService()
 
     var body: some View {
@@ -19,10 +20,30 @@ struct DreamDetailView: View {
                 Text(entry.createdAt.formatted(date: .abbreviated, time: .shortened))
                     .font(.caption).foregroundStyle(.secondary)
 
-                if let sum = entry.oracleSummary {
+                if isInterpreting {
                     Divider()
-                    Text("Oracle Summary").font(.headline)
+                    Text("Oracle Summary").font(DLFont.title(20))
+                    Group {
+                        VStack(alignment: .leading, spacing: 8) {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.secondary.opacity(0.3))
+                                .frame(height: 16)
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.secondary.opacity(0.2))
+                                .frame(height: 16)
+                                .frame(width: 250)
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.secondary.opacity(0.2))
+                                .frame(height: 16)
+                                .frame(width: 180)
+                        }
+                    }
+                    .shimmer()
+                } else if let sum = entry.oracleSummary {
+                    Divider()
+                    Text("Oracle Summary").font(DLFont.title(20))
                     Text(sum)
+                        .font(DLFont.body(16))
                         .onAppear {
                             if !hasShownInterpretation {
                                 hasShownInterpretation = true
@@ -36,23 +57,32 @@ struct DreamDetailView: View {
                         }
                     if !entry.extractedSymbols.isEmpty {
                         Text("Symbols: " + entry.extractedSymbols.joined(separator: ", "))
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(DLFont.body(12))
+                            .foregroundStyle(.secondary)
                     }
                     if !entry.themes.isEmpty {
                         Text("Themes: " + entry.themes.joined(separator: ", "))
-                            .font(.caption).foregroundStyle(.secondary)
+                            .font(DLFont.body(12))
+                            .foregroundStyle(.secondary)
                     }
                 }
 
                 Divider()
                 Button("Interpret (stub)") {
-                    let r = oracle.interpret(text: entry.rawText)
-                    entry.oracleSummary = r.summary
-                    entry.extractedSymbols = r.symbols
-                    entry.themes = r.themes
-                    hasShownInterpretation = false // Reset to trigger upsell on next appearance
+                    isInterpreting = true
+                    Task {
+                        let r = oracle.interpret(text: entry.rawText)
+                        await MainActor.run {
+                            entry.oracleSummary = r.summary
+                            entry.extractedSymbols = r.symbols
+                            entry.themes = r.themes
+                            isInterpreting = false
+                            hasShownInterpretation = false // Reset to trigger upsell on next appearance
+                        }
+                    }
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(isInterpreting)
                 
                 Divider()
                 
