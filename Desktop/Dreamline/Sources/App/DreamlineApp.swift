@@ -13,7 +13,7 @@ struct DreamlineApp: App {
     
     var body: some Scene {
         WindowGroup {
-            ContentView(firebaseState: firebaseState)
+            RootRouterView(firebaseState: firebaseState)
                 .environment(store)
                 .environment(entitlements)
                 .task {

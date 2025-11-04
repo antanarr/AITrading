@@ -2,6 +2,7 @@ import SwiftUI
 
 struct TodayView: View {
     @Environment(DreamStore.self) private var store
+    @StateObject private var vm = TodayViewModel()
     @State private var transit: TransitSummary? = nil
     private let astro = AstroService.shared
 
@@ -9,12 +10,13 @@ struct TodayView: View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    DreamSyncedCard(transit: transit, recentThemes: recentThemes())
+                    DreamSyncedCard(transit: transit, recentThemes: recentThemes(), summary: vm.summary)
                 }
                 .padding()
             }
             .navigationTitle("Today")
             .task {
+                await vm.load()
                 transit = await astro.transits(for: .now)
             }
         }
@@ -37,16 +39,17 @@ struct TodayView: View {
 private struct DreamSyncedCard: View {
     let transit: TransitSummary?
     let recentThemes: [String]
+    let summary: String
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Dream-Synced Horoscope")
                 .font(.title3).bold()
+            Text(summary)
+                .fixedSize(horizontal: false, vertical: true)
             if let transit {
-                Text(composeSummary(transit: transit))
-                    .fixedSize(horizontal: false, vertical: true)
-            } else {
-                Text("Loading today's signal…")
+                Text(transit.notes.joined(separator: " "))
+                    .font(.caption)
                     .foregroundStyle(.secondary)
             }
             if !recentThemes.isEmpty {
@@ -57,12 +60,5 @@ private struct DreamSyncedCard: View {
         }
         .padding()
         .background(RoundedRectangle(cornerRadius: 12).fill(.ultraThinMaterial))
-    }
-
-    private func composeSummary(transit: TransitSummary) -> String {
-        // Blend stubbed transit with themes
-        let themeLine = recentThemes.isEmpty ? "" :
-          " Your dreams point to \(recentThemes.joined(separator: ", "))."
-        return "Today's transits: \(transit.headline). " + transit.notes.joined(separator: " ") + themeLine
     }
 }

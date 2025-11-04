@@ -64,7 +64,7 @@ struct ComposeDreamView: View {
                     .overlay(RoundedRectangle(cornerRadius: 8).stroke(.quaternary))
                     .onAppear { if text.isEmpty { text = "" } }
 
-                AudioCaptureStub(selectedAudioURL: $audioURL)
+                AudioCaptureStub(selectedAudioURL: $audioURL, transcriptBinding: $text)
 
                 HStack {
                     if let _ = audioURL {
