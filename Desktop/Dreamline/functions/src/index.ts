@@ -1,14 +1,18 @@
 import * as functions from "firebase-functions";
-import * as admin from "firebase-admin";
+import { onRequest } from "firebase-functions/v2/https";
+import { initializeApp, getApps } from "firebase-admin/app";
+import { getFirestore } from "firebase-admin/firestore";
 import corsLib from "cors";
 import fetch from "node-fetch";
 import { z } from "zod";
 import { AstroTime, EclipticLongitude, Body } from "astronomy-engine";
 import { defineSecret } from "firebase-functions/params";
 
-admin.initializeApp();
+if (!getApps().length) {
+  initializeApp();
+}
 
-const db = admin.firestore();
+const db = getFirestore();
 const cors = corsLib({ origin: true });
 
 const OPENAI_KEY = defineSecret("OPENAI_API_KEY");
@@ -127,7 +131,7 @@ function summarizeTransits(birthISO: string, dateISO: string) {
 }
 
 // Scope gate
-export const scopeGate = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
+export const scopeGate = onRequest({ secrets: [OPENAI_KEY] }, async (req, res) => {
   return cors(req, res, async () => {
     const OPENAI = OPENAI_KEY.value();
     if (!OPENAI) return res.status(503).json({ error: "LLM unavailable" });
@@ -169,7 +173,7 @@ export const scopeGate = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRe
 });
 
 // Oracle: extract
-export const oracleExtract = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
+export const oracleExtract = onRequest({ secrets: [OPENAI_KEY] }, async (req, res) => {
   return cors(req, res, async () => {
     const OPENAI = OPENAI_KEY.value();
     if (!OPENAI) return res.status(503).json({ error: "LLM unavailable" });
@@ -253,7 +257,7 @@ async function selfCheckRevise(draftJson: any, extraction: any, transit: any, hi
 }
 
 // Oracle: interpret (history + transits + symbol notes + self-check)
-export const oracleInterpret = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
+export const oracleInterpret = onRequest({ secrets: [OPENAI_KEY] }, async (req, res) => {
   return cors(req, res, async () => {
     const OPENAI = OPENAI_KEY.value();
     if (!OPENAI) return res.status(503).json({ error: "LLM unavailable" });
@@ -325,7 +329,7 @@ OUTPUT: Follow schema exactly (shortSummary, longForm, actionPrompt, symbolCards
 });
 
 // Oracle: chat (Pro) with scope gate
-export const oracleChat = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
+export const oracleChat = onRequest({ secrets: [OPENAI_KEY] }, async (req, res) => {
   return cors(req, res, async () => {
     const OPENAI = OPENAI_KEY.value();
     if (!OPENAI) return res.status(503).json({ error: "LLM unavailable" });
@@ -409,7 +413,7 @@ export const oracleChat = functions.runWith({ secrets: [OPENAI_KEY] }).https.onR
 });
 
 // Astro transits — range composer
-export const astroTransitsRange = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
+export const astroTransitsRange = onRequest({ secrets: [OPENAI_KEY] }, async (req, res) => {
   return cors(req, res, async () => {
     const { birthISO, startISO, endISO, range = "day" } = req.body || {};
 
@@ -432,7 +436,7 @@ export const astroTransitsRange = functions.runWith({ secrets: [OPENAI_KEY] }).h
 });
 
 // Horoscope compose (text from transits)
-export const horoscopeCompose = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
+export const horoscopeCompose = onRequest({ secrets: [OPENAI_KEY] }, async (req, res) => {
   return cors(req, res, async () => {
     const OPENAI = OPENAI_KEY.value();
     if (!OPENAI) return res.status(503).json({ error: "LLM unavailable" });
@@ -456,7 +460,7 @@ export const horoscopeCompose = functions.runWith({ secrets: [OPENAI_KEY] }).htt
 });
 
 // Usage counter (atomic)
-export const incrementUsage = functions.https.onRequest(async (req, res) => {
+export const incrementUsage = onRequest(async (req, res) => {
   return cors(req, res, async () => {
     const { uid, key } = req.body || {};
 
@@ -467,7 +471,7 @@ export const incrementUsage = functions.https.onRequest(async (req, res) => {
     await db.runTransaction(async (tx) => {
       const snap = await tx.get(ref);
       const count = (snap.exists ? (snap.get("count") as number) : 0) + 1;
-      tx.set(ref, { count, updatedAt: admin.firestore.FieldValue.serverTimestamp() }, { merge: true });
+      tx.set(ref, { count, updatedAt: new Date() }, { merge: true });
     });
 
     res.json({ ok: true });

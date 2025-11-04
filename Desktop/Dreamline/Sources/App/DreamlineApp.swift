@@ -1,15 +1,37 @@
 import SwiftUI
 import UIKit
 
+#if canImport(FirebaseCore)
+import FirebaseCore
+#endif
+
+#if canImport(FirebaseCore)
+class AppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey : Any]? = nil) -> Bool {
+        FirebaseApp.configure()
+        return true
+    }
+}
+#endif
+
 @main
 struct DreamlineApp: App {
+    #if canImport(FirebaseCore)
+    @UIApplicationDelegateAdaptor(AppDelegate.self) var delegate
+    #endif
+    
     @State private var firebaseState: FirebaseBootstrapState = .notAvailable
     @State private var store = DreamStore()
     @State private var entitlements = EntitlementsService()
     
     init() {
-        FirebaseBoot.configureIfNeeded()
+        // Firebase will be configured via AppDelegate, but we still check state
+        #if canImport(FirebaseCore)
         _firebaseState = State(initialValue: FirebaseService.configureIfPossible())
+        #else
+        _firebaseState = State(initialValue: .notAvailable)
+        #endif
     }
     
     var body: some Scene {

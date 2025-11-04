@@ -17,7 +17,9 @@ struct FirebaseService {
         if Bundle.main.path(forResource: "GoogleService-Info", ofType: "plist") == nil {
             return .missingPlist
         }
+        // Firebase is now configured via AppDelegate, just check if it's configured
         if FirebaseApp.app() == nil {
+            // Fallback: configure if not already done (shouldn't happen with AppDelegate)
             FirebaseApp.configure()
         }
         return .configured
