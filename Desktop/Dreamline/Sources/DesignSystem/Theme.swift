@@ -74,5 +74,15 @@ extension View {
     func shimmer() -> some View {
         modifier(Shimmer())
     }
+    
+    func oracleShimmer(_ animate: Bool) -> some View {
+        Group {
+            if animate {
+                shimmer()
+            } else {
+                self
+            }
+        }
+    }
 }
 

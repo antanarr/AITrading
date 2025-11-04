@@ -16,9 +16,9 @@ struct DLRemoteConfig: Codable {
     var freeChatTrialCount: Int
     
     static let `default` = DLRemoteConfig(
-        freeInterpretationsPerWeek: 1,
+        freeInterpretationsPerWeek: 3,
         trialDaysPlus: 7,
-        upsellDelaySeconds: 3,
+        upsellDelaySeconds: 6,
         insightsBlurThresholdDays: 7,
         paywallVariant: "A",
         freeChatTrialCount: 3

@@ -11,10 +11,10 @@ final class UsageService: ObservableObject {
     #if canImport(FirebaseFirestore)
     private let db = Firestore.firestore()
     #endif
-    private var uid: String { "me" } // replace with real auth later
+    private var uid: String { "me" }
     
     func weeklyInterpretCount(weekStart: Date) async -> Int {
-        let key = "oracle.\(OracleQuotaKey.weekKey(weekStart))"
+        let key = "oracle.\(ISO8601DateFormatter().string(from: weekStart.startOfWeek()))"
         
         #if canImport(FirebaseFirestore)
         let snap = try? await db.collection("users").document(uid).collection("usage").document(key).getDocument()
@@ -25,23 +25,25 @@ final class UsageService: ObservableObject {
     }
     
     func incrementWeeklyInterpret(weekStart: Date) async {
-        let key = "oracle.\(OracleQuotaKey.weekKey(weekStart))"
+        let key = "oracle.\(ISO8601DateFormatter().string(from: weekStart.startOfWeek()))"
         
         #if canImport(FirebaseFirestore)
-        let currentCount = await weeklyInterpretCount(weekStart: weekStart)
-        try? await db.collection("users").document(uid).collection("usage").document(key).setData([
-            "count": currentCount + 1,
-            "updatedAt": Date()
-        ], merge: true)
+        let ref = db.collection("users").document(uid).collection("usage").document(key)
+        try? await db.runTransaction { tx in
+            let snap = try? tx.getDocument(ref)
+            let current = (snap?.get("count") as? Int) ?? 0
+            tx.setData(["count": current + 1, "updatedAt": Date()], forDocument: ref, merge: true)
+            return nil
+        }
         #endif
     }
 }
 
-enum OracleQuotaKey {
-    static func weekKey(_ date: Date) -> String {
-        let cal = Calendar.current
-        let comp = cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: date)
-        return "w\(comp.yearForWeekOfYear ?? 0)-\(comp.weekOfYear ?? 0)"
+private extension Date {
+    func startOfWeek() -> Date {
+        var cal = Calendar.current
+        cal.firstWeekday = 2
+        let comps = cal.dateComponents([.yearForWeekOfYear, .weekOfYear], from: self)
+        return cal.date(from: comps) ?? self
     }
 }
-

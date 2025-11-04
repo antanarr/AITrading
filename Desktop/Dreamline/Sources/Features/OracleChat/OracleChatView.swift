@@ -66,7 +66,8 @@ struct OracleChatView: View {
     }
     
     private func send() async {
-        let gate = OracleGate.canChat(tier: tier, sentCount: sentCount, trialCount: rc.config.freeChatTrialCount)
+        let trial = rc.config.freeChatTrialCount
+        let gate = OracleGate.canChat(tier: tier, sentCount: sentCount, trialCount: trial)
         
         guard gate == .ok else {
             showPaywall = true

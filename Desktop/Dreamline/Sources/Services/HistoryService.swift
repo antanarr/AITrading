@@ -2,12 +2,15 @@ import Foundation
 
 #if canImport(FirebaseFirestore)
 import FirebaseFirestore
+#if canImport(FirebaseFirestoreSwift)
+import FirebaseFirestoreSwift
+#endif
 #endif
 
 struct MotifHistory: Codable, Equatable {
     var topSymbols: [String]
-    var archetypeTrends: [String]   // e.g., ["threshold↑","rebirth↔"]
-    var userPhrases: [String]       // recurring bigrams
+    var archetypeTrends: [String]
+    var userPhrases: [String]
     var tones7d: [String: Int]
 }
 
@@ -18,32 +21,70 @@ final class HistoryService: ObservableObject {
     #if canImport(FirebaseFirestore)
     private let db = Firestore.firestore()
     #endif
-    private var uid: String { "me" } // replace with Auth later
-    
-    private init() {}
+    private var uid: String { "me" } // TODO: replace with real Auth
     
     func summarize(days: Int) async -> MotifHistory {
-        // Pull last N dreams; this is a simple client-side summarizer.
-        // If you have a dreams collection, query and aggregate; else return empty defaults.
-        let topSymbols = await recentTopSymbols(days: days)
-        let trends = computeTrends()
-        let phrases = await commonPhrases(days: days)
-        let tones: [String: Int] = ["curious": 3, "anxious": 1] // TODO: compute from stored tone
+        let since = Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date().addingTimeInterval(-86400 * Double(days))
         
-        return MotifHistory(topSymbols: topSymbols, archetypeTrends: trends, userPhrases: phrases, tones7d: tones)
+        var symbolCounts: [String: Int] = [:]
+        var archetypeCounts: [String: Int] = [:]
+        var toneCounts: [String: Int] = [:]
+        var bigramCounts: [String: Int] = [:]
+        
+        // Query recent dreams
+        #if canImport(FirebaseFirestore)
+        do {
+            let qs = try await db.collection("users").document(uid)
+                .collection("dreams")
+                .whereField("createdAt", isGreaterThan: since)
+                .order(by: "createdAt", descending: true)
+                .limit(to: 300)
+                .getDocuments()
+            
+            for doc in qs.documents {
+                if let extraction = doc.data()["extraction"] as? [String: Any],
+                   let symbols = extraction["symbols"] as? [[String: Any]] {
+                    for s in symbols {
+                        if let name = s["name"] as? String, !name.isEmpty {
+                            symbolCounts[name, default: 0] += (s["count"] as? Int ?? 1)
+                        }
+                    }
+                    if let arche = extraction["archetypes"] as? [String] {
+                        for a in arche {
+                            archetypeCounts[a, default: 0] += 1
+                        }
+                    }
+                }
+                
+                if let tone = doc.data()["tone"] as? String, !tone.isEmpty {
+                    toneCounts[tone, default: 0] += 1
+                }
+                
+                if let text = doc.data()["text"] as? String {
+                    extractBigrams(from: text).forEach { bigramCounts[$0, default: 0] += 1 }
+                }
+            }
+        } catch {}
+        #endif
+        
+        let topSymbols = symbolCounts.sorted { $0.value > $1.value }.prefix(5).map { $0.key }
+        let archetypeTrends = archetypeCounts.sorted { $0.value > $1.value }.prefix(3).map { "\($0.key)↑" }
+        let userPhrases = bigramCounts.sorted { $0.value > $1.value }.prefix(3).map { $0.key }
+        let tones7d = toneCounts
+        
+        return MotifHistory(topSymbols: topSymbols, archetypeTrends: archetypeTrends, userPhrases: userPhrases, tones7d: tones7d)
     }
     
-    private func recentTopSymbols(days: Int) async -> [String] {
-        // TODO: query Firestore users/{uid}/dreams ordered by createdAt desc and tally extraction.symbols
-        return ["water", "door", "room"]
-    }
-    
-    private func commonPhrases(days: Int) async -> [String] {
-        return ["locked room", "high water"]
-    }
-    
-    private func computeTrends() -> [String] {
-        return ["threshold↑", "rebirth↔"]
+    private func extractBigrams(from text: String) -> [String] {
+        let tokens = text.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        let stops: Set<String> = ["the", "a", "an", "and", "of", "to", "in", "on", "for", "with", "at", "by", "from", "as", "is", "it", "this", "that", "i", "you", "he", "she", "we", "they"]
+        
+        var grams: [String] = []
+        for i in 0..<(max(0, tokens.count - 1)) {
+            let a = tokens[i], b = tokens[i + 1]
+            if stops.contains(a) || stops.contains(b) { continue }
+            grams.append("\(a) \(b)")
+        }
+        return grams
     }
 }
-

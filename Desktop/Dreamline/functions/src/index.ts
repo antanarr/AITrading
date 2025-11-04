@@ -4,19 +4,18 @@ import corsLib from "cors";
 import fetch from "node-fetch";
 import { z } from "zod";
 import { AstroTime, EclipticLongitude, Body } from "astronomy-engine";
+import { defineSecret } from "firebase-functions/params";
 
 admin.initializeApp();
 
 const db = admin.firestore();
 const cors = corsLib({ origin: true });
 
-const OPENAI = process.env.OPENAI_API_KEY as string;
+const OPENAI_KEY = defineSecret("OPENAI_API_KEY");
 const OPENAI_BASE = process.env.OPENAI_BASE || "https://api.openai.com";
+const ENABLE_SELF_CHECK = true;
 
-if (!OPENAI) console.warn("OPENAI_API_KEY not set; Oracle endpoints will 503");
-
-// ---------- Schemas ----------
-
+// Schemas
 const ExtractSchema = z.object({
   symbols: z.array(z.object({ name: z.string(), count: z.number().int().nonnegative() })),
   tone: z.string(),
@@ -49,9 +48,8 @@ const HoroscopeSchema = z.object({
   }))
 });
 
-// ---------- Helpers ----------
-
-async function callResponses(model: string, input: any): Promise<any> {
+// Helpers
+async function callResponses(model: string, input: any, OPENAI: string): Promise<any> {
   const res = await fetch(`${OPENAI_BASE}/v1/responses`, {
     method: "POST",
     headers: { "Authorization": `Bearer ${OPENAI}`, "Content-Type": "application/json" },
@@ -64,25 +62,24 @@ async function callResponses(model: string, input: any): Promise<any> {
   return await res.json();
 }
 
-// Minimal symbol lexicon seed (extend via Firestore later if desired)
+// Mini symbol lexicon
 const SYMBOL_NOTES: Record<string, string> = {
-  water: "Emotion seeking motion; tides of feeling, permeability, intuition.",
-  door: "Threshold between familiar and new; permission; agency over entry.",
-  room: "Compartmentalized psyche; safety or secrecy; defined boundaries.",
-  house: "Self-structure; identity, family, security, roles.",
-  bird: "Message, perspective, aspiration; lightness vs tether.",
-  teeth: "Power/articulation; vulnerability about expression or appearance.",
-  flight: "Freedom vs avoidance; higher vantage; exhilaration/anxiety.",
-  ocean: "Vast unconscious; awe, dissolution of edges; depth of feeling."
+  water: "Emotion seeking motion; permeability; intuition.",
+  door: "Threshold between familiar and new; agency over entry.",
+  room: "Compartmentalized psyche; safety or secrecy.",
+  house: "Self-structure; identity; security; roles.",
+  bird: "Message, perspective; aspiration.",
+  teeth: "Power/articulation; vulnerability about expression.",
+  flight: "Freedom vs avoidance; higher vantage.",
+  ocean: "Vast unconscious; dissolution of edges."
 };
 
-// ---------- Aspect math ----------
-
+// Aspect math
 const bodies: Body[] = ["Sun", "Moon", "Mercury", "Venus", "Mars"] as any;
 
 function eclLon(body: Body, time: Date): number {
   const t = new AstroTime(time);
-  return EclipticLongitude(body, t); // 0..360
+  return EclipticLongitude(body, t);
 }
 
 function degDiff(a: number, b: number): number {
@@ -129,10 +126,10 @@ function summarizeTransits(birthISO: string, dateISO: string) {
   return { headline, notes };
 }
 
-// ---------- Scope gate (classifier) ----------
-
-export const scopeGate = functions.https.onRequest(async (req, res) => {
+// Scope gate
+export const scopeGate = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
   return cors(req, res, async () => {
+    const OPENAI = OPENAI_KEY.value();
     if (!OPENAI) return res.status(503).json({ error: "LLM unavailable" });
 
     const { text, model = "gpt-4.1-mini" } = req.body || {};
@@ -160,7 +157,7 @@ export const scopeGate = functions.https.onRequest(async (req, res) => {
           strict: true
         }
       }
-    });
+    }, OPENAI);
 
     const textOut = r.output_text ?? (r.output?.[0]?.content?.[0]?.text ?? "{}");
     try {
@@ -171,10 +168,10 @@ export const scopeGate = functions.https.onRequest(async (req, res) => {
   });
 });
 
-// ---------- Oracle: extract ----------
-
-export const oracleExtract = functions.https.onRequest(async (req, res) => {
+// Oracle: extract
+export const oracleExtract = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
   return cors(req, res, async () => {
+    const OPENAI = OPENAI_KEY.value();
     if (!OPENAI) return res.status(503).json({ error: "LLM unavailable" });
 
     const dream = String(req.body?.dream || "");
@@ -215,7 +212,7 @@ export const oracleExtract = functions.https.onRequest(async (req, res) => {
         type: "json_schema",
         json_schema: { name: "OracleExtraction", schema, strict: true }
       }
-    });
+    }, OPENAI);
 
     const text = r.output_text ?? (r.output?.[0]?.content?.[0]?.text ?? "");
     const parsed = ExtractSchema.safeParse(JSON.parse(text));
@@ -226,34 +223,53 @@ export const oracleExtract = functions.https.onRequest(async (req, res) => {
   });
 });
 
-// ---------- Oracle: interpret (history + transits) ----------
+// Self-check/Revise helper
+async function selfCheckRevise(draftJson: any, extraction: any, transit: any, history: any, OPENAI: string, model: string) {
+  if (!ENABLE_SELF_CHECK) return draftJson;
 
-export const oracleInterpret = functions.https.onRequest(async (req, res) => {
+  const sys = "Score the provided Dreamline Oracle draft (JSON) on 5 beats: mirror phrase, anchor symbol, tension named, transit tie, micro-action. Return JSON {scores:{mirror:0..1,anchor:0..1,tension:0..1,transit:0..1,action:0..1}}. If any < 0.6, revise the draft once to satisfy all five beats and return ONLY the final JSON matching the OracleInterpretation schema.";
+
+  const prompt = [
+    { role: "system", content: sys },
+    { role: "user", content: "Draft:" + JSON.stringify(draftJson) },
+    { role: "user", content: "Extraction:" + JSON.stringify(extraction) },
+    { role: "user", content: "Transit:" + JSON.stringify(transit) },
+    { role: "user", content: "History:" + JSON.stringify(history || {}) },
+    { role: "user", content: "Symbol notes:" + JSON.stringify(SYMBOL_NOTES) }
+  ];
+
+  const r = await callResponses(model, { input: prompt }, OPENAI);
+
+  const txt = r.output_text ?? (r.output?.[0]?.content?.[0]?.text ?? "");
+
+  try {
+    const parsed = JSON.parse(txt);
+    // If it looks like a score wrapper, keep original; if it looks like full schema, use it.
+    if (parsed && parsed.shortSummary && parsed.longForm && parsed.actionPrompt && parsed.symbolCards) return parsed;
+    return draftJson;
+  } catch {
+    return draftJson;
+  }
+}
+
+// Oracle: interpret (history + transits + symbol notes + self-check)
+export const oracleInterpret = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
   return cors(req, res, async () => {
+    const OPENAI = OPENAI_KEY.value();
     if (!OPENAI) return res.status(503).json({ error: "LLM unavailable" });
 
     const { dream, extraction, transit, history, model = "gpt-4.1-mini" } = req.body || {};
 
     const system =
-`You are the Dreamline Oracle. Write brief, reflective readings that connect the user's dream symbols with
-their ongoing motifs and today's transits. Stay grounded in the provided dream text, extracted symbols,
-history, and transit summary.
+`You are the Dreamline Oracle. Write brief, reflective readings that connect the user's dream symbols with their ongoing motifs and today's transits. Stay grounded in the given dream text, extracted symbols, history, and transit summary.
 
-VOICE:
-- Address the user as "you"; calm, lyrical but clear. Avoid clichés; one vivid image max.
-- Short summary: 1–2 sentences. Long form: 3–6 sentences (≈120–180 words). End with one concrete micro‑action.
+VOICE: Second person; calm, lyrical but clear. Avoid clichés; one vivid image max. Short summary 1–2 sentences. Long form 3–6 sentences (≈120–180 words). End with one concrete micro‑action.
 
-RESONANCE:
-- Mirror one phrase from the dream/history (e.g., "locked room", "high water").
-- Name one universal tension bound to this dream (safety↔change, control↔surrender) using the given symbols.
-- Tie one symbol to the transit headline as an influence (no predictions).
+RESONANCE: Mirror one phrase from dream/history; name one universal tension bound to THIS imagery; tie one symbol to the transit headline as an influence (no predictions).
 
-GUARDRAILS:
-- No deterministic forecasts, medical/legal/financial advice, diagnosis, or real‑world names not in the dream.
-- If the input is off‑topic, gently reframe toward symbol work.
+GUARDRAILS: No deterministic forecasts; no medical/legal/financial advice; no diagnosis; no real‑world names not in the dream. If user went off-topic, gently reframe toward symbol work.
 
-OUTPUT:
-Follow the JSON schema exactly (shortSummary, longForm, actionPrompt, symbolCards[]). Keep symbol meanings concise. Use SYMBOL_NOTES when relevant.`;
+OUTPUT: Follow schema exactly (shortSummary, longForm, actionPrompt, symbolCards[] with concise meanings). Use symbol notes when helpful.`;
 
     const schema = {
       type: "object",
@@ -279,14 +295,14 @@ Follow the JSON schema exactly (shortSummary, longForm, actionPrompt, symbolCard
       additionalProperties: false
     };
 
-    const grounding = "Symbol lexicon hints: " + Object.entries(SYMBOL_NOTES).map(([k, v]) => `${k}: ${v}`).join(" | ");
+    const grounding = "Symbol notes: " + Object.entries(SYMBOL_NOTES).map(([k, v]) => `${k}: ${v}`).join(" | ");
 
     const prompt = [
       { role: "system", content: system + "\n" + grounding },
-      { role: "user", content: `Dream: ${dream}` },
-      { role: "user", content: `Extraction: ${JSON.stringify(extraction)}` },
-      { role: "user", content: `Transit: ${JSON.stringify(transit)}` },
-      { role: "user", content: `History: ${JSON.stringify(history ?? {})}` }
+      { role: "user", content: "Dream: " + String(dream ?? "") },
+      { role: "user", content: "Extraction: " + JSON.stringify(extraction ?? {}) },
+      { role: "user", content: "Transit: " + JSON.stringify(transit ?? {}) },
+      { role: "user", content: "History: " + JSON.stringify(history ?? {}) }
     ];
 
     const r = await callResponses(model, {
@@ -295,26 +311,27 @@ Follow the JSON schema exactly (shortSummary, longForm, actionPrompt, symbolCard
         type: "json_schema",
         json_schema: { name: "OracleInterpretation", schema, strict: true }
       }
-    });
+    }, OPENAI);
 
     const text = r.output_text ?? (r.output?.[0]?.content?.[0]?.text ?? "");
     const parsed = InterpretSchema.safeParse(JSON.parse(text));
 
     if (!parsed.success) return res.status(422).json({ error: parsed.error.flatten() });
 
-    res.json(parsed.data);
+    const final = await selfCheckRevise(parsed.data, extraction, transit, history, OPENAI, model);
+
+    res.json(final);
   });
 });
 
-// ---------- Oracle: chat (Pro) with scope gate ----------
-
-export const oracleChat = functions.https.onRequest(async (req, res) => {
+// Oracle: chat (Pro) with scope gate
+export const oracleChat = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
   return cors(req, res, async () => {
+    const OPENAI = OPENAI_KEY.value();
     if (!OPENAI) return res.status(503).json({ error: "LLM unavailable" });
 
     const { messages, history, dreamContext, transit, model = "gpt-4.1-mini" } = req.body || {};
 
-    // Pre-gate
     const gate = await callResponses(model, {
       input: [
         { role: "system", content: "Return JSON {inScope:boolean, reason:string} for dream/astrology relevance." },
@@ -336,7 +353,7 @@ export const oracleChat = functions.https.onRequest(async (req, res) => {
           strict: true
         }
       }
-    });
+    }, OPENAI);
 
     const gateText = gate.output_text ?? (gate.output?.[0]?.content?.[0]?.text ?? "{}");
     let inScope = true;
@@ -352,16 +369,13 @@ export const oracleChat = functions.https.onRequest(async (req, res) => {
       });
     }
 
-    const system =
-`You are the Dreamline Oracle Chat. Stay strictly anchored to dream symbols, emotions, archetypes, and the provided transits/history.
-
-No predictions or advice in medical/legal/financial domains. Keep responses 2–5 sentences, end with one reflective question.`;
+    const system = "You are the Dreamline Oracle Chat. Stay anchored to dream symbols, emotions, archetypes, and the provided transits/history. No predictions or medical/legal/financial advice. 2–5 sentences, end with one reflective question.";
 
     const payload = [
       { role: "system", content: system },
-      { role: "user", content: `Transit: ${JSON.stringify(transit ?? {})}` },
-      { role: "user", content: `History: ${JSON.stringify(history ?? {})}` },
-      ...(dreamContext ? [{ role: "user", content: `Dream context: ${dreamContext}` }] : []),
+      { role: "user", content: "Transit: " + JSON.stringify(transit ?? {}) },
+      { role: "user", content: "History: " + JSON.stringify(history ?? {}) },
+      ...(dreamContext ? [{ role: "user", content: "Dream context: " + dreamContext }] : []),
       ...((messages ?? []) as Array<{ role: string; content: string }>)
     ];
 
@@ -383,7 +397,7 @@ No predictions or advice in medical/legal/financial domains. Keep responses 2–
           strict: true
         }
       }
-    });
+    }, OPENAI);
 
     const text = r.output_text ?? (r.output?.[0]?.content?.[0]?.text ?? "");
     const parsed = ChatSchema.safeParse(JSON.parse(text));
@@ -394,15 +408,12 @@ No predictions or advice in medical/legal/financial domains. Keep responses 2–
   });
 });
 
-// ---------- Astro: range (day/week/month/year) ----------
-
-export const astroTransitsRange = functions.https.onRequest(async (req, res) => {
+// Astro transits — range composer
+export const astroTransitsRange = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
   return cors(req, res, async () => {
-    const { birthISO, startISO, endISO, step = "day", range = "day" } = req.body || {};
+    const { birthISO, startISO, endISO, range = "day" } = req.body || {};
 
-    if (!birthISO || !startISO || !endISO) {
-      return res.status(400).json({ error: "birthISO, startISO, endISO required" });
-    }
+    if (!birthISO || !startISO || !endISO) return res.status(400).json({ error: "birthISO, startISO, endISO required" });
 
     const start = new Date(String(startISO));
     const end = new Date(String(endISO));
@@ -420,26 +431,23 @@ export const astroTransitsRange = functions.https.onRequest(async (req, res) => 
   });
 });
 
-// ---------- Horoscope: compose text from transits ----------
-
-export const horoscopeCompose = functions.https.onRequest(async (req, res) => {
+// Horoscope compose (text from transits)
+export const horoscopeCompose = functions.runWith({ secrets: [OPENAI_KEY] }).https.onRequest(async (req, res) => {
   return cors(req, res, async () => {
+    const OPENAI = OPENAI_KEY.value();
     if (!OPENAI) return res.status(503).json({ error: "LLM unavailable" });
 
     const { range, items, model = "gpt-4.1-mini" } = req.body || {};
 
-    const sys =
-`You write succinct, grounded horoscope guidance based on transit headlines/bullets already computed.
-Tone: calm, reflective, poetic‑practical. No predictions or fate claims; no health/finance/legal advice.
-For 'day' return 1–2 sentences. For 'week' return 3 bullets. For 'month' return 4–6 bullets. For 'year' return 5–8 bullets.`;
+    const sys = "You write succinct, grounded horoscope guidance based on transit headlines/bullets already computed. Tone: calm, reflective, poetic‑practical. No predictions or fate claims; no health/finance/legal advice. For 'day' 1–2 sentences. For 'week' 3 bullets. For 'month' 4–6 bullets. For 'year' 5–8 bullets.";
 
     const prompt = [
       { role: "system", content: sys },
-      { role: "user", content: `Range: ${range}` },
-      { role: "user", content: `Transits: ${JSON.stringify(items)}` }
+      { role: "user", content: "Range: " + String(range ?? "day") },
+      { role: "user", content: "Transits: " + JSON.stringify(items ?? []) }
     ];
 
-    const r = await callResponses(model, { input: prompt });
+    const r = await callResponses(model, { input: prompt }, OPENAI);
 
     const text = r.output_text ?? (r.output?.[0]?.content?.[0]?.text ?? "");
 
@@ -447,8 +455,7 @@ For 'day' return 1–2 sentences. For 'week' return 3 bullets. For 'month' retur
   });
 });
 
-// ---------- Usage counter (atomic) ----------
-
+// Usage counter (atomic)
 export const incrementUsage = functions.https.onRequest(async (req, res) => {
   return cors(req, res, async () => {
     const { uid, key } = req.body || {};
@@ -466,4 +473,3 @@ export const incrementUsage = functions.https.onRequest(async (req, res) => {
     res.json({ ok: true });
   });
 });
-

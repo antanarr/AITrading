@@ -16,11 +16,9 @@ struct TodayRangeView: View {
             .pickerStyle(.segmented)
             
             if vm.loading {
-                Text("Composing…")
-                    .shimmer()
-            } else if !vm.composed.isEmpty {
-                Text(vm.composed)
-                    .font(DLFont.body(16))
+                Text("Composing…").oracleShimmer(true)
+            } else {
+                Text(vm.composed).font(DLFont.body(16))
             }
         }
         .padding()
