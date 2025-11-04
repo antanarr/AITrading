@@ -50,5 +50,9 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>FunctionsBaseURL</key>
+	<string>https://us-central1-dreamline-16dae.cloudfunctions.net</string>
+	<key>OracleModel</key>
+	<string>gpt-4.1-mini</string>
 </dict>
 </plist>

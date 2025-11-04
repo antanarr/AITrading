@@ -18,6 +18,8 @@ struct TodayView: View {
                         isLoadingSummary: vm.isLoading,
                         isLoadingTransit: isLoadingTransit
                     )
+                    
+                    TodayRangeView()
                 }
                 .padding()
             }

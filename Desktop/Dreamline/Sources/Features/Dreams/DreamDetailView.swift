@@ -68,20 +68,37 @@ struct DreamDetailView: View {
                 }
 
                 Divider()
-                Button("Interpret (stub)") {
+                InterpretButtonGate(tier: entitlements.tier) {
                     isInterpreting = true
                     Task {
-                        let r = oracle.interpret(text: entry.rawText)
-                        await MainActor.run {
-                            entry.oracleSummary = r.summary
-                            entry.extractedSymbols = r.symbols
-                            entry.themes = r.themes
-                            isInterpreting = false
-                            hasShownInterpretation = false // Reset to trigger upsell on next appearance
+                        // Use CloudOracleClient if available, otherwise fallback to stub
+                        let client: OracleClient = {
+                            let baseURL = (Bundle.main.object(forInfoDictionaryKey: "FunctionsBaseURL") as? String) ?? ""
+                            return baseURL.isEmpty ? StubOracleClient() : CloudOracleClient()
+                        }()
+                        
+                        let coordinator = InterpretCoordinator(oracle: client)
+                        if let interpretation = await coordinator.runInterpret(dreamText: entry.rawText) {
+                            await MainActor.run {
+                                entry.oracleSummary = interpretation.shortSummary
+                                entry.extractedSymbols = interpretation.symbolCards.map { $0.name }
+                                entry.themes = [] // Can be extracted from interpretation if needed
+                                isInterpreting = false
+                                hasShownInterpretation = false // Reset to trigger upsell on next appearance
+                            }
+                        } else {
+                            // Fallback to old method
+                            let r = oracle.interpret(text: entry.rawText)
+                            await MainActor.run {
+                                entry.oracleSummary = r.summary
+                                entry.extractedSymbols = r.symbols
+                                entry.themes = r.themes
+                                isInterpreting = false
+                                hasShownInterpretation = false
+                            }
                         }
                     }
                 }
-                .buttonStyle(.borderedProminent)
                 .disabled(isInterpreting)
                 
                 Divider()

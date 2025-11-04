@@ -29,6 +29,82 @@ protocol OracleClient {
     func interpret(dreamText: String,
                    extraction: OracleExtraction,
                    transit: TransitSummary) async throws -> OracleInterpretation
+    func interpret(dreamText: String,
+                   extraction: OracleExtraction,
+                   transit: TransitSummary,
+                   history: MotifHistory) async throws -> OracleInterpretation
+}
+
+extension OracleClient {
+    func interpret(dreamText: String,
+                   extraction: OracleExtraction,
+                   transit: TransitSummary,
+                   history: MotifHistory) async throws -> OracleInterpretation {
+        return try await interpret(dreamText: dreamText, extraction: extraction, transit: transit)
+    }
+}
+
+final class CloudOracleClient: OracleClient {
+    private let baseURL = (Bundle.main.object(forInfoDictionaryKey: "FunctionsBaseURL") as? String) ?? ""
+    let model: String = (Bundle.main.object(forInfoDictionaryKey: "OracleModel") as? String) ?? "gpt-4.1-mini"
+    
+    func extract(from text: String) async throws -> OracleExtraction {
+        guard !baseURL.isEmpty else {
+            throw URLError(.badURL)
+        }
+        
+        struct Req: Encodable {
+            let dream: String
+            let model: String
+        }
+        
+        var req = URLRequest(url: URL(string: "\(baseURL)/oracleExtract")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(Req(dream: text, model: model))
+        
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            throw URLError(.badServerResponse)
+        }
+        
+        return try JSONDecoder().decode(OracleExtraction.self, from: data)
+    }
+    
+    func interpret(dreamText: String,
+                   extraction: OracleExtraction,
+                   transit: TransitSummary) async throws -> OracleInterpretation {
+        return try await interpret(dreamText: dreamText, extraction: extraction, transit: transit, history: MotifHistory(topSymbols: [], archetypeTrends: [], userPhrases: [], tones7d: [:]))
+    }
+    
+    func interpret(dreamText: String,
+                   extraction: OracleExtraction,
+                   transit: TransitSummary,
+                   history: MotifHistory) async throws -> OracleInterpretation {
+        guard !baseURL.isEmpty else {
+            throw URLError(.badURL)
+        }
+        
+        struct Req: Encodable {
+            let dream: String
+            let extraction: OracleExtraction
+            let transit: TransitSummary
+            let history: MotifHistory
+            let model: String
+        }
+        
+        var req = URLRequest(url: URL(string: "\(baseURL)/oracleInterpret")!)
+        req.httpMethod = "POST"
+        req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        req.httpBody = try JSONEncoder().encode(Req(dream: dreamText, extraction: extraction, transit: transit, history: history, model: model))
+        
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        guard (resp as? HTTPURLResponse)?.statusCode == 200 else {
+            throw URLError(.badServerResponse)
+        }
+        
+        return try JSONDecoder().decode(OracleInterpretation.self, from: data)
+    }
 }
 
 final class StubOracleClient: OracleClient {
@@ -50,6 +126,13 @@ final class StubOracleClient: OracleClient {
     func interpret(dreamText: String,
                    extraction: OracleExtraction,
                    transit: TransitSummary) async throws -> OracleInterpretation {
+        return try await interpret(dreamText: dreamText, extraction: extraction, transit: transit, history: MotifHistory(topSymbols: [], archetypeTrends: [], userPhrases: [], tones7d: [:]))
+    }
+    
+    func interpret(dreamText: String,
+                   extraction: OracleExtraction,
+                   transit: TransitSummary,
+                   history: MotifHistory) async throws -> OracleInterpretation {
         let top = extraction.symbols.sorted(by: { $0.count > $1.count }).first?.name ?? "symbol"
         let short = "\(top.capitalized) + \(transit.headline): a day for gentle, honest reflection."
         let long = """

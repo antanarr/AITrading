@@ -13,13 +13,15 @@ struct DLRemoteConfig: Codable {
     var upsellDelaySeconds: Int
     var insightsBlurThresholdDays: Int
     var paywallVariant: String
+    var freeChatTrialCount: Int
     
     static let `default` = DLRemoteConfig(
         freeInterpretationsPerWeek: 1,
         trialDaysPlus: 7,
         upsellDelaySeconds: 3,
         insightsBlurThresholdDays: 7,
-        paywallVariant: "A"
+        paywallVariant: "A",
+        freeChatTrialCount: 3
     )
 }
 

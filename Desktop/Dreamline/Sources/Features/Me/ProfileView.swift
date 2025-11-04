@@ -18,6 +18,14 @@ struct ProfileView: View {
                     Button("Manage Subscription") { showPaywall = true }
                 }
                 
+                if entitlements.tier == .pro {
+                    Section("Oracle") {
+                        NavigationLink("Oracle Chat") {
+                            OracleChatView(tier: entitlements.tier)
+                        }
+                    }
+                }
+                
                 Section("Security") {
                     Toggle("Require Face ID on Resume", isOn: $lockEnabled)
                         .disabled(!AppLockService.canEvaluate())

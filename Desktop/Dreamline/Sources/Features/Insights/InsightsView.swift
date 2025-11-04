@@ -12,12 +12,14 @@ struct InsightsView: View {
     
     var body: some View {
         NavigationView {
-            InsightsGate(isFreeUser: entitlements.tier == .free, daysShown: daysShown) {
-                VStack {
-                    Text("Insights")
-                        .font(.largeTitle)
-                        .fontWeight(.bold)
+            ScrollView {
+                VStack(alignment: .leading, spacing: 16) {
+                    InsightsHeatmapSection(
+                        tier: entitlements.tier,
+                        isFreeUser: entitlements.tier == .free
+                    )
                 }
+                .padding()
             }
             .navigationTitle("Insights")
         }
