@@ -1,0 +1,123 @@
+{
+  "identifier" : "AC8A2F34",
+  "nonRenewingSubscriptions" : [
+
+  ],
+  "products" : [
+    {
+      "displayPrice" : "6.99",
+      "familyShareable" : false,
+      "internalID" : "6736123456",
+      "localizations" : [
+        {
+          "description" : "Unlimited dream interpretations, daily horoscope, and 30-day insights",
+          "displayName" : "Dreamline Plus",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.example.dreamline.plus.monthly",
+      "referenceName" : "Plus Monthly",
+      "subscriptionGroupID" : "21482608",
+      "subscriptionPeriod" : "P1M",
+      "type" : "AutoRenewableSubscription"
+    },
+    {
+      "displayPrice" : "14.99",
+      "familyShareable" : false,
+      "internalID" : "6736123457",
+      "localizations" : [
+        {
+          "description" : "Voice transcription, oracle chat, and 90-day insights",
+          "displayName" : "Dreamline Pro",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.example.dreamline.pro.monthly",
+      "referenceName" : "Pro Monthly",
+      "subscriptionGroupID" : "21482608",
+      "subscriptionPeriod" : "P1M",
+      "type" : "AutoRenewableSubscription"
+    },
+    {
+      "displayPrice" : "4.99",
+      "familyShareable" : false,
+      "internalID" : "6736123458",
+      "localizations" : [
+        {
+          "description" : "One-time purchase for a detailed dream analysis report",
+          "displayName" : "Deep Read Report",
+          "locale" : "en_US"
+        }
+      ],
+      "productID" : "com.example.dreamline.deepread.once",
+      "referenceName" : "Deep Read",
+      "type" : "NonConsumable"
+    }
+  ],
+  "settings" : {
+    "_failTransactionsEnabled" : false,
+    "_storeKitErrors" : [
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Load Products"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Purchase"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Verification"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "App Store Sync"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Subscription Status"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "App Transaction"
+      },
+      {
+        "current" : null,
+        "enabled" : false,
+        "name" : "Manage Subscriptions Sheet"
+      },
+      {
+      "current" : null,
+      "enabled" : false,
+      "name" : "Refund Request Sheet"
+      },
+      {
+      "current" : null,
+      "enabled" : false,
+      "name" : "Offer Code Redeem Sheet"
+      }
+    ],
+    "_subscriptionRenewalRate" : 0.0,
+    "_useStoreKit2" : true,
+    "storefront" : "USA"
+  },
+  "subscriptionGroups" : [
+    {
+      "id" : "21482608",
+      "localizations" : [
+
+      ],
+      "name" : "Dreamline Subscriptions"
+    }
+  ],
+  "version" : {
+    "major" : 3,
+    "minor" : 0
+  }
+}

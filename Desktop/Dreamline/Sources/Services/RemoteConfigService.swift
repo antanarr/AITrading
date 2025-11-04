@@ -2,7 +2,9 @@ import Foundation
 
 #if canImport(FirebaseFirestore)
 import FirebaseFirestore
+#if canImport(FirebaseFirestoreSwift)
 import FirebaseFirestoreSwift
+#endif
 #endif
 
 struct DLRemoteConfig: Codable {

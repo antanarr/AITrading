@@ -1,0 +1,47 @@
+name: Dreamline
+options:
+  bundleIdPrefix: com.example
+  deploymentTarget:
+    iOS: "17.0"
+packages:
+  Firebase:
+    url: https://github.com/firebase/firebase-ios-sdk
+    from: 11.0.0
+targets:
+  Dreamline:
+    type: application
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: Sources
+      - path: Reports
+    resources:
+      - path: Resources
+    dependencies:
+      - package: Firebase
+        product: FirebaseAuth
+      - package: Firebase
+        product: FirebaseFirestore
+      - package: Firebase
+        product: FirebaseAnalytics
+      - package: Firebase
+        product: FirebaseMessaging
+      - package: Firebase
+        product: FirebaseRemoteConfig
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.example.dreamline
+      INFOPLIST_FILE: Info.plist
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+      OTHER_SWIFT_FLAGS: -warnings-as-errors
+  DreamlineTests:
+    type: bundle.unit-test
+    platform: iOS
+    deploymentTarget: "17.0"
+    sources:
+      - path: DreamlineTests
+    dependencies:
+      - target: Dreamline
+    settings:
+      PRODUCT_BUNDLE_IDENTIFIER: com.example.dreamlineTests
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+      OTHER_SWIFT_FLAGS: -warnings-as-errors

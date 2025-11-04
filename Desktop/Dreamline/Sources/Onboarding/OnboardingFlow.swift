@@ -22,8 +22,8 @@ struct OnboardingFlow: View {
             LinearGradient(colors: [.dlSpace, .black], startPoint: .top, endPoint: .bottom).ignoresSafeArea()
             content
         }
-        .tint(.dlViolet)
-        .foregroundStyle(.dlMoon)
+                .tint(.dlViolet)
+                .foregroundColor(.dlMoon)
         .animation(.easeInOut, value: step)
     }
     

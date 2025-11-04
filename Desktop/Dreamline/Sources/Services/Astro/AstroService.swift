@@ -2,7 +2,9 @@ import Foundation
 
 #if canImport(FirebaseFirestore)
 import FirebaseFirestore
+#if canImport(FirebaseFirestoreSwift)
 import FirebaseFirestoreSwift
+#endif
 #endif
 
 struct BirthData: Codable, Equatable {
@@ -38,9 +40,18 @@ final class AstroService: ObservableObject {
         birth = data
         
         #if canImport(FirebaseFirestore)
-        try await db.collection("users").document(uid)
+        #if canImport(FirebaseFirestoreSwift)
+        try db.collection("users").document(uid)
             .collection("astro").document("birth")
             .setData(from: data, merge: true)
+        #else
+        // Fallback: manual encoding if FirebaseFirestoreSwift not available
+        let encoder = Firestore.Encoder()
+        let encoded = try encoder.encode(data)
+        try await db.collection("users").document(uid)
+            .collection("astro").document("birth")
+            .setData(encoded, merge: true)
+        #endif
         #endif
     }
     

@@ -1,0 +1,13 @@
+default_platform(:ios)
+
+platform :ios do
+  desc "Build Dreamline for debug"
+  lane :build do
+    sh "xcodebuild -project Dreamline.xcodeproj -scheme Dreamline -sdk iphonesimulator -configuration Debug"
+  end
+
+  desc "Archive & upload to TestFlight (stub; prints only)"
+  lane :beta do
+    UI.message("🚀  (Stub) Would build and upload Dreamline to TestFlight.")
+  end
+end
