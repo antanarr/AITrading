@@ -20,10 +20,14 @@
 	<string>1.0</string>
 	<key>CFBundleVersion</key>
 	<string>1</string>
+	<key>FunctionsBaseURL</key>
+	<string>https://us-central1-dreamline-16dae.cloudfunctions.net</string>
 	<key>LSRequiresIPhoneOS</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Dreamline uses the microphone to attach dream voice notes.</string>
+	<key>OracleModel</key>
+	<string>gpt-4.1-mini</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
@@ -50,9 +54,5 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
-	<key>FunctionsBaseURL</key>
-	<string>https://us-central1-dreamline-16dae.cloudfunctions.net</string>
-	<key>OracleModel</key>
-	<string>gpt-4.1-mini</string>
 </dict>
 </plist>
