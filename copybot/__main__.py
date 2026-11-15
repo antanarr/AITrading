@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from pydantic import ValidationError
 
 from .advisor import Advisor
+from .credentials import credential_status, load_credentials, open_setup
 from .engine import PaperEngine
 from .models import Assessment, Quote, Settings, Trade
 from .runner import Runner
@@ -58,6 +59,10 @@ def main(argv=None):
     parser.add_argument("--db", type=Path, default=ROOT / "state/paper.sqlite")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("demo", help="Run an offline demonstration with fictional wallets")
+    cp = sub.add_parser(
+        "credentials", help="Open secure macOS credential setup or show saved status"
+    )
+    cp.add_argument("action", choices=["setup", "status"])
     rp = sub.add_parser("replay", help="Replay normalized observations into the paper ledger")
     rp.add_argument("file", type=Path)
     for name in ("status", "pause", "resume"):
@@ -72,11 +77,19 @@ def main(argv=None):
     args = parser.parse_args(argv)
     load_dotenv(ROOT / ".env")
     try:
+        if args.command == "credentials":
+            if args.action == "setup":
+                open_setup()
+                emit({"credential_window": "opened", "storage": "macOS Keychain"})
+            else:
+                emit(credential_status())
+            return 0
         with httpx.Client(timeout=15, follow_redirects=False) as client:
             if args.command == "discover":
                 candidates = []
                 if not args.source and not args.imports:
                     raise ValueError("Choose --source or --import")
+                load_credentials([f"{source.upper()}_API_KEY" for source in args.source])
                 for name in args.source:
                     source = (
                         Birdeye(client, os.getenv("BIRDEYE_API_KEY", ""))
@@ -94,6 +107,10 @@ def main(argv=None):
                 return 0
             cfg_path = ROOT / "examples/demo.yaml" if args.command == "demo" else args.config
             cfg = Settings.model_validate(yaml.safe_load(cfg_path.read_text()))
+            if args.command in {"watch", "replay"} and cfg.advisor == "openai":
+                load_credentials(["OPENAI_API_KEY", "COPYBOT_OPENAI_MODEL"])
+            if args.command == "watch":
+                load_credentials(["BIRDEYE_API_KEY", "SOLANA_RPC_URL"])
             if args.command in {"status", "pause", "resume"} and not args.db.exists():
                 raise ValueError("Paper database does not exist yet; run replay or watch first")
             store = Store(":memory:" if args.command == "demo" else args.db, cfg.initial_cash_usd)

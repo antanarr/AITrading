@@ -23,9 +23,24 @@ response coverage, polling latency, and actual model responses were not verified
 No real funds were connected, no real orders were submitted, and profitability
 was not tested or established. No watcher was left running.
 
-The next connected validation needs data-provider credentials in the local `.env`
+The next connected validation needs data-provider credentials in Keychain (or an optional local `.env`)
 and selected Solana wallets with their allocations and reference equity values.
 A funded execution layer remains a separate implementation step after observing
 the paper system with real data. It would need transaction signing, route quotes,
 sellability checks, submission and confirmation recovery, and position
 reconciliation before it could responsibly operate unattended with real funds.
+
+## Credential setup
+
+The credential setup update passed 57 Python tests, including checks that only
+requested secrets are loaded, existing environment values take precedence,
+missing and denied Keychain items are handled explicitly, secret output is not
+included in errors, and status accepts only boolean presence flags. The native
+macOS helper compiled and was locally ad-hoc signed. A native integration check
+saved, updated, read, and deleted a fictional value in a temporary Keychain
+service, then verified its removal. No real credentials were used in that test.
+
+The setup window uses native masked fields and local Keychain calls. It has no
+provider network requests and does not start the bot. The Python application
+retrieves values through the same helper into memory when needed. The default
+macOS setup no longer requires a plaintext `.env` file.

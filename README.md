@@ -26,10 +26,47 @@ a full exit, and ignores a duplicate event. Its output shows the cash balance,
 remaining positions, fees, and recorded decisions. The synthetic assessment is
 labeled; no AI call or real market performance is implied.
 
+## Add credentials on your Mac
+
+Open `Open Credential Setup.command`, or run:
+
+```sh
+.venv/bin/python -m copybot credentials setup
+```
+
+A native window provides masked fields for Birdeye, Nansen, the full Solana RPC
+endpoint, and OpenAI. The model ID has a normal text field. Click **Save to
+Keychain**. Blank fields preserve saved values, so you can add providers later.
+The window clears entered values after you save and never displays saved secrets.
+Saving neither contacts providers nor starts trading. No wallet private key,
+seed phrase, or exchange withdrawal credential is requested.
+
+Credentials are stored as local generic-password items in macOS Keychain under
+`com.antanarr.AITrading.paper.credentials`. They are not written to the repository
+or a `.env` file. The helper app is installed in `~/Library/Application
+Support/AITrading/`. On first launch the script compiles it locally using the
+Xcode command-line tools. macOS may request Keychain access, particularly after a
+helper update.
+
+The bot retrieves only the values needed for the requested operation through a
+captured subprocess pipe. Secret values are not command arguments, printed
+output, or status fields. Existing environment variables and optional `.env`
+values take precedence. `.env` remains supported for other setups and stays
+Git-ignored; Keychain is the preferred setup on this Mac.
+
+To check which fields are saved without displaying their values:
+
+```sh
+.venv/bin/python -m copybot credentials status
+```
+
+To remove a saved value, use macOS **Keychain Access** and search for
+`AITrading`. Removing it does not change the value at its provider.
+
 ## Discover wallets
 
-Copy `.env.example` to `.env` and add your data-provider keys locally. Do not
-commit that file. Birdeye and Nansen keys are separate from exchange credentials.
+Birdeye and Nansen use separate data-provider keys. Configure either or both
+through the credential window, then run:
 
 ```sh
 .venv/bin/python -m copybot discover --source birdeye --output state/birdeye-candidates.json
@@ -78,7 +115,7 @@ Keep disabled traders in the roster until their copied positions are closed.
 
 ## Monitor real activity with simulated funds
 
-Set `BIRDEYE_API_KEY` and an HTTPS `SOLANA_RPC_URL` whose provider supports
+Save a Birdeye API key and an HTTPS Solana RPC URL whose provider supports
 finalized transaction and block history. Then run:
 
 ```sh
@@ -111,8 +148,8 @@ the command, for example `python -m copybot --db state/trial.sqlite watch`.
 The default `advisor: rules` uses a stated rule to reduce entries after repeated
 copied losses. It is explicitly reported as rules-only.
 
-To use the model adapter, set `advisor: openai`, add `OPENAI_API_KEY`, and choose
-a model supporting Structured Outputs in `COPYBOT_OPENAI_MODEL`. It can reduce
+To use the model adapter, set `advisor: openai`, save an OpenAI API key, and choose
+a model supporting Structured Outputs in the credential window. It can reduce
 or suspend entries using the paper account's recent outcomes. It cannot increase
 the approved size, override limits, or prevent exits. Invalid or unavailable
 assessments reject new entries. Assessments are cached briefly rather than
