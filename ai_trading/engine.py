@@ -76,6 +76,9 @@ class TradingEngine:
 
     @classmethod
     def from_env(cls, cfg: Optional[Config] = None, paper: bool = True):
+        raise RuntimeError(
+            "The legacy engine is retired. Use python -m copybot; live trading is unavailable."
+        )
         cfg = cfg or Config.load(DEFAULT_CONFIG_PATH)
         use_testnet = os.getenv("USE_TESTNET")
         if use_testnet is not None:

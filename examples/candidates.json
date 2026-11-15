@@ -1,0 +1,5 @@
+[
+  {"wallet": "demo-trader-a", "sources": ["birdeye"], "evidence": {"birdeye": {"note": "Fictional example"}}},
+  {"wallet": "demo-trader-a", "sources": ["gmgn"], "evidence": {"gmgn": {"note": "Fictional example"}}},
+  {"wallet": "demo-trader-b", "sources": ["defined"], "evidence": {"defined": {"note": "Fictional example"}}}
+]

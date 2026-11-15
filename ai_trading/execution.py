@@ -64,6 +64,10 @@ class PaperAccount:
 
 class ExecutionClient:
     def __init__(self, cfg: Config, exchange: ccxt.Exchange, paper: bool = True) -> None:
+        raise RuntimeError(
+            "The legacy execution engine is retired because its accounting is unsafe. "
+            "Use python -m copybot for the replacement paper engine."
+        )
         self.cfg = cfg
         self.exchange = exchange
         self.paper = paper

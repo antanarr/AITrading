@@ -1,0 +1,12 @@
+mode: paper
+initial_cash_usd: '1000'
+advisor: rules
+traders:
+  - wallet: demo-trader-a
+    sources: [birdeye, gmgn]
+    allocation: '0.40'
+    reference_equity_usd: '100000'
+  - wallet: demo-trader-b
+    sources: [nansen, defined]
+    allocation: '0.30'
+    reference_equity_usd: '50000'

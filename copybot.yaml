@@ -1,0 +1,20 @@
+# Personal paper account. Discover candidates, then select wallets to follow.
+mode: paper
+initial_cash_usd: '1000'
+advisor: rules
+advisor_ttl_seconds: 120
+poll_seconds: 15
+traders: []
+limits:
+  max_trade_usd: '50'
+  max_token_fraction: '0.15'
+  max_total_fraction: '0.70'
+  daily_loss_fraction: '0.03'
+  min_trade_usd: '5'
+  min_liquidity_usd: '100000'
+  max_price_drift: '0.02'
+  max_signal_age_seconds: 90
+  max_quote_age_seconds: 30
+  fee_bps: '30'
+  slippage_bps: '50'
+  stop_loss_fraction: '0.15'

@@ -1,98 +1,141 @@
-# AITrading Starter
+# AITrading
 
-This repository packages a multi-model ensemble trading bot that can run in paper or live mode. It orchestrates signals from GPT, Claude, and any OpenAI-compatible endpoint (Grok, etc.), applies consensus logic, and routes resulting trades through `ccxt`.
+A personal wallet-copying bot with multiple discovery sources, proportional
+position sizing, and optional AI adjustments. This version trades simulated funds.
+It cannot submit real orders or access a wallet's private keys.
 
-## Features
+Birdeye and Nansen discovery adapters find candidate wallets. Wallets found on
+GMGN, Defined, or elsewhere can be imported with their source information.
+The same wallet found twice becomes one candidate. Discovery does not enable it
+for copying: choose the wallets, capital allocations, and reference account sizes
+in the configuration first.
 
-- **Multi-model voting brain** – Prompt OpenAI, Anthropic, and Grok-compatible models. Each model must respond with JSON containing `{action, confidence, stop_pct, take_pct, reason}`.
-- **Ensemble logic** – Require at least two models to agree above a configurable confidence threshold before executing trades.
-- **Execution layer** – Paper trading account simulation or live trading through any `ccxt` exchange (defaults to MEXC, also works with Phemex/Binance/Coinbase, etc.).
-- **Webhook server** – Optional FastAPI webhook that can receive TradingView alerts and forward them to the execution layer.
-- **Risk guardrails** – Configurable risk-per-trade, daily loss limit, and kill-switch behaviour baked into the execution flow.
+## Try the working demo
 
-## Quick start
+Requires Python 3.11 or newer.
 
-1. **Create a virtual environment and install dependencies**
+```sh
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements-copy.txt
+.venv/bin/python -m copybot demo
+```
 
-   ```bash
-   python -m venv .venv
-   source .venv/bin/activate
-   pip install -r requirements.txt
-   ```
+The offline demo uses fictional wallets and no credentials. It copies two traders
+buying the same token, applies a synthetic size reduction, mirrors a half sale and
+a full exit, and ignores a duplicate event. Its output shows the cash balance,
+remaining positions, fees, and recorded decisions. The synthetic assessment is
+labeled; no AI call or real market performance is implied.
 
-2. **Configure API keys**
+## Discover wallets
 
-   ```bash
-   cp .env.example .env
-   nano .env
-   ```
+Copy `.env.example` to `.env` and add your data-provider keys locally. Do not
+commit that file. Birdeye and Nansen keys are separate from exchange credentials.
 
-   Fill in any credentials you have:
+```sh
+.venv/bin/python -m copybot discover --source birdeye --output state/birdeye-candidates.json
+.venv/bin/python -m copybot discover --source nansen --output state/nansen-candidates.json
+.venv/bin/python -m copybot discover --import examples/candidates.json
+```
 
-   - `OPENAI_API_KEY`
-   - `ANTHROPIC_API_KEY`
-   - `GROK_BASE_URL` and `GROK_API_KEY` for an OpenAI-compatible Grok endpoint
-   - Exchange credentials (`API_KEY`, `API_SECRET`) and set `USE_TESTNET=true` for sandbox trading
+Sources and imports can be combined in one command. Output files are optional.
+`examples/candidates.json` documents
+the import format using fictional addresses. GMGN and Defined currently use this
+import path; this version does not scrape their sites.
 
-3. **Update `config.yaml`**
+Birdeye discovery returns a 30-day ranking by realized P&L and retains unrealized
+P&L and trade count for review. Nansen discovery returns recently active Smart
+Money wallets. These are different kinds of evidence, and both need further
+evaluation before allocating capital.
 
-   - Add/remove symbols
-   - Adjust the ensemble consensus threshold
-   - Tune risk controls or switch exchanges (MEXC by default)
+## Configure the paper portfolio
 
-4. **Paper trade**
+Edit `copybot.yaml`. It starts with an empty roster and $1,000 of simulated cash.
+For example, this assigns one wallet 30% of the paper portfolio:
 
-   ```bash
-   python main.py --symbols BTC/USDT --timeframe 5m --paper --once
-   ```
+```yaml
+traders:
+  - wallet: REPLACE_WITH_SOLANA_WALLET_ADDRESS
+    sources: [birdeye, gmgn]
+    allocation: '0.30'
+    reference_equity_usd: '100000'
+    enabled: true
+```
 
-   Use `--once` to run a single cycle. Drop it to keep looping at the configured interval (default 60 seconds).
+With those settings, a $10,000 entry by that trader requests a $30 copied entry
+before the advisor and risk limits. Reference equity is the source account value
+you choose for scaling. It is not automatically inferred from a leaderboard.
+Enabled allocations cannot exceed 100% in total.
 
-5. **Go live**
+Default limits include $50 per entry, 15% shared exposure to one token, 70% total
+exposure, minimum liquidity, price drift, signal freshness, and a daily equity
+loss check. Paper fills include fees and adverse slippage. The defaults are
+starting settings for evaluation, not investment recommendations.
 
-   ```bash
-   python main.py --symbols BTC/USDT --timeframe 5m --live
-   ```
+Exits mirror the fraction sold from the trader's pre-transaction token balance,
+verified using finalized Solana transaction data. Each trader has a separate
+position record. Disabling a trader or pausing entries still permits their exits.
+Keep disabled traders in the roster until their copied positions are closed.
 
-   Ensure you have loaded real API keys and disabled testnet mode in `config.yaml` before going live.
+## Monitor real activity with simulated funds
 
-## TradingView → Webhook
+Set `BIRDEYE_API_KEY` and an HTTPS `SOLANA_RPC_URL` whose provider supports
+finalized transaction and block history. Then run:
 
-1. Launch the webhook server:
+```sh
+.venv/bin/python -m copybot watch
+```
 
-   ```bash
-   uvicorn webhook:app --host 0.0.0.0 --port 8000
-   ```
+Add `--once` for one polling cycle. The first cycle establishes when following
+starts; it does not buy historical holdings. Subsequent cycles poll wallet trades,
+verify token changes and transaction order against Solana, and simulate eligible
+copies. Supported targets are Solana spot tokens; perpetual futures and multiple
+chains are not implemented.
 
-2. Use this alert payload in TradingView:
+This polling version prioritizes an auditable record. It is not yet a low-latency
+live execution bot. Data outages pause new entries; inspect missed exits and data
+gaps before resuming. Stops also require fresh price data.
 
-   ```json
-   {
-     "symbol": "BTC/USDT",
-     "side": "{{strategy.order.action}}",
-     "reason": "TV alert: {{ticker}} {{close}}",
-     "confidence": 0.66,
-     "stop_pct": 0.01,
-     "take_pct": 0.02
-   }
-   ```
+```sh
+.venv/bin/python -m copybot status
+.venv/bin/python -m copybot pause
+.venv/bin/python -m copybot resume
+```
 
-3. Point the alert to `http://YOUR_IP:8000/signal`. If you set `webhook_secret` in `config.yaml`, add the same value as an `X-Webhook-Secret` header in the TradingView alert.
+SQLite stores cash, positions, decisions, pause state, and polling cursors in
+`state/paper.sqlite`. Restarting does not reset money or repeat processed events.
+Use a separate `--db` path for a separate paper account. Global options go before
+the command, for example `python -m copybot --db state/trial.sqlite watch`.
 
-## Configuration reference
+## Enable AI assessments
 
-Key tunables in `config.yaml`:
+The default `advisor: rules` uses a stated rule to reduce entries after repeated
+copied losses. It is explicitly reported as rules-only.
 
-- `providers` – Toggle or update model IDs, temperature, and token limits.
-- `ensemble.min_confidence` – Minimum model confidence for a vote to count.
-- `ensemble.require_agreement` – Minimum number of models that must agree before a trade fires.
-- `risk` – Risk per trade (fraction of account balance) and daily loss kill switch.
-- `exchange` – Select a `ccxt` exchange, override parameters, and toggle sandbox mode.
+To use the model adapter, set `advisor: openai`, add `OPENAI_API_KEY`, and choose
+a model supporting Structured Outputs in `COPYBOT_OPENAI_MODEL`. It can reduce
+or suspend entries using the paper account's recent outcomes. It cannot increase
+the approved size, override limits, or prevent exits. Invalid or unavailable
+assessments reject new entries. Assessments are cached briefly rather than
+requesting a new model response for every transaction.
 
-## Roadmap / next steps
+News analysis, independent trade ideas, automatic trader selection, and profitable
+performance are not established by this implementation.
 
-- Add exchange-specific futures parameters (isolated/hedge mode, leverage) for MEXC or Phemex.
-- Expand strategy prompts and include additional indicators.
-- Persist trade logs and performance metrics to disk or a database.
+## Replay and verification
 
-Contributions and customisations are welcome—start by tweaking `config.yaml` and the prompts in `ai_trading/strategy.py`.
+```sh
+.venv/bin/python -m copybot --config examples/demo.yaml --db state/replay.sqlite replay examples/demo.jsonl
+.venv/bin/python -m pip install -r requirements-dev.txt
+.venv/bin/python -m pytest -q
+```
+
+Replay files contain one JSON observation per line: `observed_at`, a normalized
+`trade`, a current `quote`, and an optional recorded `assessment`. Observation
+times must be chronological. Reusing the same database is idempotent; use a new
+database for a separate experiment. Historical observations must contain only
+information available at their observation time.
+
+See [data assumptions and current limits](docs/DATA_SOURCES.md) and the
+[old-project review](docs/OLD_PROJECT_REVIEW.md). The old exchange engine is
+disabled, the old webhook returns HTTP 410, and `main.py` now starts this CLI.
+The unrelated historical Dreamline directory is not part of this application.
