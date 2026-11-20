@@ -1,3 +1,4 @@
+from dataclasses import replace
 from decimal import Decimal
 from unittest.mock import Mock
 
@@ -6,7 +7,19 @@ import pytest
 
 from copybot.autopilot import Journal, Runner, Settings, entry_order
 from copybot.hyperliquid import TradingError
-from copybot.perps import BAR_MS, Book, Market, Signal, breakout, now_ms, round_price
+from copybot.perps import (
+    BAR_MS,
+    SENTIMENT_MAX_AGE_MS,
+    Book,
+    Feed,
+    Market,
+    Signal,
+    breakout,
+    market_breadth,
+    now_ms,
+    rank_signal,
+    round_price,
+)
 
 MARKET = Market("BTC", 5, Decimal("100000000"), Decimal(0), Decimal("100"))
 BOOK = Book(Decimal("99.99"), Decimal("100.01"), Decimal(1), Decimal(1), now_ms())
@@ -26,12 +39,87 @@ def test_breakout_uses_only_completed_contiguous_bars(long):
                 "c": str(close),
                 "h": "101",
                 "l": "99",
+                "v": "200" if index == 23 else "100",
             }
         )
     signal = breakout(MARKET, bars, 24 * BAR_MS + 10)
     assert signal.long == long
     assert signal.bar_end == bars[23]["T"]
+    assert signal.relative_volume == Decimal(2)
     assert breakout(MARKET, bars[1:], 24 * BAR_MS + 10) is None
+
+
+def test_sentiment_refresh_uses_recent_cache_and_rejects_expired_readings():
+    timestamp = 1_800_000_000_000
+    requested = []
+
+    def respond(request):
+        requested.append(request.url.host)
+        if len(requested) > 1:
+            return httpx.Response(503)
+        return httpx.Response(
+            200,
+            json={
+                "metadata": {"error": None},
+                "data": [
+                    {"value": "18", "timestamp": str(timestamp // 1000)},
+                ],
+            },
+        )
+
+    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
+        feed = Feed(client)
+        current = feed.fear_and_greed(timestamp)
+        assert current["index"] == 18 and current["source"] == "Alternative.me"
+        assert feed.fear_and_greed(timestamp + 60_000) == current
+        cached = feed.fear_and_greed(timestamp + 60 * 60 * 1000)
+        assert cached["status"] == "cached" and cached["index"] == 18
+        stale = feed.fear_and_greed(timestamp + SENTIMENT_MAX_AGE_MS + 1)
+        assert stale["status"] == "stale" and "index" not in stale
+        assert requested == ["api.alternative.me"] * 3
+
+
+def test_crypto_context_applies_to_native_perps_only():
+    markets = [
+        replace(MARKET, coin=coin, change_24h=Decimal("-0.02"))
+        for coin in ("BTC", "ETH", "SOL", "HYPE", "XRP")
+    ]
+    builder = replace(MARKET, coin="xyz:XYZ100", change_24h=Decimal("0.03"))
+    breadth = market_breadth([*markets, builder], min_volume=10_000_000)
+    assert breadth == {"advancing": 0, "declining": 5, "total": 5}
+    native_short = Signal(markets[0], False, 1, Decimal(100), Decimal(99), Decimal("1.8"))
+    builder_short = replace(native_short, market=builder)
+    assert rank_signal(native_short, breadth, {"index": 18}).score == 4
+    assert rank_signal(builder_short, breadth, {"index": 18}).score == 2
+    assert rank_signal(native_short, breadth, {"status": "unavailable"}).score == 3
+
+
+def test_scan_prioritizes_ranked_signals_and_keeps_existing_funding_limit(monkeypatch):
+    high_volume = replace(MARKET, coin="ETH", volume=Decimal("200000000"))
+    expensive = replace(MARKET, coin="HYPE", funding=Decimal("0.001"))
+    feed = Feed(Mock())
+    monkeypatch.setattr(
+        feed,
+        "markets",
+        lambda dex: {asset.coin: asset for asset in (MARKET, high_volume, expensive)},
+    )
+    monkeypatch.setattr(feed, "fear_and_greed", lambda observed_at: {"status": "unavailable"})
+    monkeypatch.setattr(
+        feed,
+        "signal",
+        lambda asset, observed_at: Signal(
+            asset,
+            True,
+            observed_at - 1,
+            Decimal(100),
+            Decimal(101),
+            Decimal("0.5") if asset == high_volume else Decimal(2),
+        ),
+    )
+    signals, scan = feed.scan(allowed=["BTC", "ETH", "HYPE"])
+    assert [signal.market.coin for signal in signals] == ["BTC", "ETH"]
+    assert scan["evaluated"] == 3
+    assert signals[0].evidence()["breakout_volume_vs_median"] == "2.00"
 
 
 @pytest.mark.parametrize("long", [True, False])

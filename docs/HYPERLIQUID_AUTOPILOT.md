@@ -6,6 +6,16 @@ venues. A signal requires a completed 15-minute candle to break the range of
 the preceding 12 candles in the direction of the trend. The strategy can go
 long, go short or stay flat. Its profitability is unverified.
 
+When several breakouts qualify, the worker checks the highest-ranked setup
+first. It favors unusual volume on the breakout candle and ranks an entry
+lower if that side pays relatively high funding. For native crypto perps it
+also considers how many liquid crypto contracts are moving in the same
+direction and gives a small weight to extreme values on the daily [Bitcoin
+Fear & Greed Index from Alternative.me](https://alternative.me/crypto/fear-and-greed-index/).
+Stock and other builder perps use their own volume and funding. An unavailable
+or stale sentiment reading contributes no points. Scan logs and live entry
+records include the score, reasons, and source timestamp where available.
+
 Live entries also require a market on the configured list, a recent order book,
 a spread no wider than 8 basis points, and offered size sufficient for the
 order. Adverse hourly funding above 2 basis points disqualifies the entry.

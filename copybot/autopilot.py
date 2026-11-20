@@ -190,7 +190,7 @@ class Runner:
         )
         for signal in signals:
             if signal.bar_end <= self.journal.get("last_bar", 0):
-                break
+                continue
             coin = signal.market.coin
             if not self.gateway.flat_market(coin):
                 continue
@@ -216,6 +216,8 @@ class Runner:
                 "stop_bps": str(cfg.stop_bps),
                 "target_bps": str(cfg.target_bps),
                 "max_hold_minutes": cfg.max_hold_minutes,
+                "signal": signal.evidence(),
+                "market_context": counts.get("market_context", {}),
             }
             if not self.journal.stage_entry(trade, utc_day(), cfg.max_entries_per_day):
                 return "Entry skipped because the journal changed"
@@ -379,6 +381,7 @@ def scan_result(feed):
                 "bar_end_ms": row.bar_end,
                 "breakout_price": row.trigger,
                 "close": row.close,
+                **row.evidence(),
             }
             for row in signals
         ],
