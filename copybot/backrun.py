@@ -12,6 +12,7 @@ from .autopilot import Settings, entry_order, protection_prices, utc_day
 from .perps import BAR_MS, BPS, Book, Market, breakout, market_breadth, number, rank_signal
 
 STEP = 5 * 60 * 1000
+HOUR = 60 * 60 * 1000
 DAY = 24 * 60 * 60 * 1000
 TRADED = ("BTC", "ETH", "SOL", "HYPE")
 FEE = Decimal("0.00045")
@@ -79,22 +80,27 @@ def combine_15m(rows):
 
 
 class Tape:
-    def __init__(self, data):
+    def __init__(self, data, *, step=STEP, warmup_days=1):
         self.start, self.end = data["start_ms"], data["end_ms"]
-        self.history = self.start - DAY
+        if step not in (STEP, BAR_MS, HOUR) or warmup_days < 1:
+            raise ValueError("Unsupported replay interval or warmup")
+        self.step = step
+        self.history = self.start - warmup_days * DAY
         if self.start % DAY or self.end % DAY or self.end <= self.start:
             raise ValueError("Backrun requires complete UTC trading days")
         self.decimals = data["meta"]
-        self.five = {}
-        self.fifteen = {}
+        self.execution = {}
+        self.signal_step = max(BAR_MS, step)
+        self.bars = {}
         self.turnover = {}
         for coin, rows in data["candles"].items():
+            period = step if coin in TRADED else self.signal_step
+            bars = validated_bars(coin, rows, self.history, self.end, period)
             if coin in TRADED:
-                self.five[coin] = validated_bars(coin, rows, self.history, self.end, STEP)
-                bars = combine_15m(self.five[coin])
-            else:
-                bars = validated_bars(coin, rows, self.history, self.end, BAR_MS)
-            self.fifteen[coin] = bars
+                self.execution[coin] = bars
+            if period == STEP:
+                bars = combine_15m(bars)
+            self.bars[coin] = bars
             totals = [Decimal(0)]
             for bar in bars:
                 totals.append(totals[-1] + number(bar["c"]) * number(bar["v"]))
@@ -105,8 +111,8 @@ class Tape:
             rows = sorted(
                 (row["time"], number(row["fundingRate"])) for row in data["funding"][coin]
             )
-            hours = [time // 3_600_000 for time, _ in rows]
-            expected = list(range(self.history // 3_600_000, self.end // 3_600_000))
+            hours = [time // HOUR for time, _ in rows]
+            expected = list(range(self.history // HOUR, self.end // HOUR))
             if hours != expected:
                 raise ValueError(f"{coin} funding observations are missing or duplicated")
             self.funding[coin] = rows
@@ -118,26 +124,31 @@ class Tape:
             raise ValueError("Invalid historical sentiment")
 
     def open_bar(self, coin, time):
-        return self.five[coin][(time - self.history) // STEP]
+        return self.execution[coin][(time - self.history) // self.step]
+
+    def previous_bars(self, coin, time, count):
+        index = (time - self.history) // self.signal_step
+        return self.bars[coin][max(0, index - count) : index]
 
     def prior_close(self, coin, time):
-        index = (time - self.history) // BAR_MS
-        return number(self.fifteen[coin][index - 1]["c"])
+        return number(self.previous_bars(coin, time, 1)[0]["c"])
 
-    def signals(self, time, min_volume, max_funding):
-        index = (time - self.history) // BAR_MS
-        window = DAY // BAR_MS
-        markets = []
-        for coin, bars in self.fifteen.items():
+    def markets_at(self, time):
+        index = (time - self.history) // self.signal_step
+        window = DAY // self.signal_step
+        for coin, bars in self.bars.items():
             totals = self.turnover[coin]
             volume = totals[index] - totals[index - window]
             close, prev = number(bars[index - 1]["c"]), number(bars[index - window]["o"])
             end = bisect_left(self.funding_times.get(coin, []), time)
             funding = self.funding[coin][end - 1][1] if end else Decimal(0)
             mark = number(self.open_bar(coin, time)["o"]) if coin in TRADED else close
-            markets.append(
-                Market(coin, self.decimals[coin], volume, funding, mark, close / prev - 1)
-            )
+            yield Market(coin, self.decimals[coin], volume, funding, mark, close / prev - 1)
+
+    def signals(self, time, min_volume, max_funding):
+        if self.signal_step != BAR_MS:
+            raise ValueError("The breakout baseline requires 15-minute signals")
+        markets = list(self.markets_at(time))
         breadth = market_breadth(markets, min_volume)
         # Publication time within a historical sentiment day is unavailable.
         previous = [value for stamp, value in self.sentiment if stamp < time // DAY * DAY]
@@ -146,7 +157,7 @@ class Tape:
         for asset in markets:
             if asset.coin not in TRADED or asset.volume < min_volume:
                 continue
-            signal = breakout(asset, self.fifteen[asset.coin][index - 24 : index], time)
+            signal = breakout(asset, self.previous_bars(asset.coin, time, 24), time)
             if signal and asset.funding * (1 if signal.long else -1) * BPS <= max_funding:
                 candidates.append(rank_signal(signal, breadth, sentiment))
         return sorted(
@@ -159,10 +170,7 @@ class Tape:
         applicable = self.funding[coin][bisect_right(times, entered) : bisect_right(times, exited)]
         return sum(
             (
-                -side
-                * size
-                * rate
-                * number(self.five[coin][(time - self.history) // STEP - 1]["c"])
+                -side * size * rate * number(self.open_bar(coin, time - self.step)["c"])
                 for time, rate in applicable
             ),
             Decimal(0),
@@ -172,14 +180,15 @@ class Tape:
 def exit_signal(tape, trade, stamp, cfg, scenario, *, intrabar):
     row = tape.open_bar(trade["coin"], stamp)
     side, opened = trade["side"], number(row["o"])
-    stop, goal = trade["stop"], trade["entry"] * (1 + side * cfg.target_bps / BPS)
-    goal_mid = goal / (1 - side * scenario.half_spread_bps / BPS)
+    stop = trade["stop"]
+    goal = trade.get("target", trade["entry"] * (1 + side * cfg.target_bps / BPS))
+    goal_mid = None if goal is None else goal / (1 - side * scenario.half_spread_bps / BPS)
     if not intrabar:
         if (opened - stop) * side <= 0:
             return "stop gap", opened
-        if (opened - goal_mid) * side >= 0:
+        if goal_mid is not None and (opened - goal_mid) * side >= 0:
             return "take profit", opened
-        if stamp - trade["entered"] >= cfg.max_hold_minutes * 60_000:
+        if stamp - trade["entered"] >= trade.get("hold_ms", cfg.max_hold_minutes * 60_000):
             return "maximum hold", opened
         if scenario.reversal and stamp % BAR_MS == 0 and stamp > trade["entered"]:
             if (tape.prior_close(trade["coin"], stamp) - trade["breakout"]) * side <= 0:
@@ -188,12 +197,17 @@ def exit_signal(tape, trade, stamp, cfg, scenario, *, intrabar):
     worst, best = (number(row[key]) for key in (("l", "h") if side == 1 else ("h", "l")))
     if (worst - stop) * side <= 0:
         return "stop", stop
-    if (best - goal_mid) * side >= 0:
+    if goal_mid is not None and (best - goal_mid) * side >= 0:
         return "take profit", goal_mid
     return None
 
 
-def replay(tape, initial, cfg, scenario):
+def replay(tape, initial, cfg, scenario, *, rules=None, start=None, end=None):
+    start = tape.start if start is None else start
+    end = tape.end if end is None else end
+    if not tape.start <= start < end <= tape.end or start % DAY or end % DAY:
+        raise ValueError("Replay partition must be within the tape and use UTC day boundaries")
+    interval = tape.signal_step if rules is None else rules.interval
     pnl_by_day = defaultdict(Decimal)
     starts = {}
     attempts = Counter()
@@ -230,7 +244,7 @@ def replay(tape, initial, cfg, scenario):
         )
         position = None
 
-    for stamp in range(tape.start, tape.end, STEP):
+    for stamp in range(start, end, tape.step):
         day = utc_day(stamp)
         if day not in starts:
             starts[day] = initial + net_total
@@ -240,11 +254,13 @@ def replay(tape, initial, cfg, scenario):
                     position["side"] * position["size"] * (opening_mark - position["entry"])
                 )
         if position:
+            if rules is not None and stamp % interval == 0:
+                rules.update_stop(tape, position, stamp)
             signal = exit_signal(tape, position, stamp, cfg, scenario, intrabar=False)
             if signal:
                 close(stamp, *signal)
                 continue
-        elif stamp % BAR_MS == 0 and attempts[day] < cfg.max_entries_per_day:
+        elif stamp % interval == 0 and attempts[day] < cfg.max_entries_per_day:
             loss = cfg.max_daily_loss_usdc
             if scenario.loss_fraction is not None:
                 loss = min(loss, starts[day] * scenario.loss_fraction)
@@ -253,7 +269,12 @@ def replay(tape, initial, cfg, scenario):
                 continue
             if initial + net_total < cfg.max_order_usd * Decimal("1.005"):
                 continue
-            for signal in tape.signals(stamp, cfg.min_volume_usd, cfg.max_funding_bps):
+            signals = (
+                tape.signals(stamp, cfg.min_volume_usd, cfg.max_funding_bps)
+                if rules is None
+                else rules.signals(tape, stamp, cfg)
+            )
+            for signal in signals:
                 side = 1 if signal.long else -1
                 mid, half = signal.market.mark, scenario.half_spread_bps / BPS
                 book = Book(
@@ -274,7 +295,6 @@ def replay(tape, initial, cfg, scenario):
                 )
                 if (mid - trigger) * side <= 0 or trigger <= 0:
                     continue
-                attempts[day] += 1
                 position = {
                     "coin": signal.market.coin,
                     "side": side,
@@ -284,18 +304,22 @@ def replay(tape, initial, cfg, scenario):
                     "stop": trigger,
                     "breakout": signal.trigger,
                 }
+                if rules is not None and not rules.prepare_position(tape, position, stamp):
+                    position = None
+                    continue
+                attempts[day] += 1
                 if filled * size > cfg.max_order_usd:
                     close(stamp, "filled notional exceeded cap", mid)
                 break
         if position:
             signal = exit_signal(tape, position, stamp, cfg, scenario, intrabar=True)
             if signal:
-                close(stamp + STEP - 1, *signal)
+                close(stamp + tape.step - 1, *signal)
     if position:
         close(
-            tape.end - 1,
+            end - 1,
             "sample ended",
-            number(tape.open_bar(position["coin"], tape.end - STEP)["c"]),
+            number(tape.open_bar(position["coin"], end - tape.step)["c"]),
         )
     return {
         "scenario": scenario.name,
