@@ -88,6 +88,12 @@ class AccountGateway:
             order["coin"] == coin for order in orders
         )
 
+    def has_market_fills(self, coin, since):
+        rows = self.feed.info("userFillsByTime", user=self.owner, startTime=since)
+        if len(rows) >= 2000:
+            raise TradingError("Fill history is incomplete for order reconciliation")
+        return any(row["coin"] == coin for row in rows)
+
     def lookup(self, coin, cloid):
         row = self.feed.info("orderStatus", user=self.owner, oid=cloid)
         if row["status"] == "unknownOid":
@@ -96,7 +102,18 @@ class AccountGateway:
             raise TradingError("Order lookup returned different details than expected")
         return row["order"]
 
-    def sdk(self, coin):
+    def historical_order(self, coin, cloid):
+        rows = self.feed.info("historicalOrders", user=self.owner)
+        return next(
+            (
+                row
+                for row in rows
+                if row["order"]["coin"] == coin and row["order"].get("cloid") == cloid
+            ),
+            None,
+        )
+
+    def sdk(self, coin, expires_at=None):
         from hyperliquid.exchange import Exchange
 
         self.verify()
@@ -110,7 +127,10 @@ class AccountGateway:
                 timeout=6,
             )
         client = self.exchange[dex]
-        client.set_expires_after(min(now_ms() + 10_000, self.approval_expires))
+        deadline = min(expires_at or now_ms() + 10_000, self.approval_expires)
+        if deadline <= now_ms():
+            raise TradingError("Signed action deadline passed before submission")
+        client.set_expires_after(deadline)
         return client
 
     def prepare_margin(self, coin, buy, required_margin):
@@ -135,7 +155,9 @@ class AccountGateway:
             if available < required_margin * cushion:
                 raise TradingError(f"Insufficient isolated collateral for {coin}")
 
-    def order(self, coin, buy, size, price, cloid, *, reduce_only=False, stop=None):
+    def order(
+        self, coin, buy, size, price, cloid, *, reduce_only=False, stop=None, expires_at=None
+    ):
         from hyperliquid.utils.types import Cloid
 
         kind = (
@@ -143,7 +165,7 @@ class AccountGateway:
             if stop is None
             else {"trigger": {"isMarket": True, "triggerPx": float(stop), "tpsl": "sl"}}
         )
-        result = self.sdk(coin).order(
+        result = self.sdk(coin, expires_at).order(
             coin,
             buy,
             float(size),
@@ -152,6 +174,8 @@ class AccountGateway:
             reduce_only=reduce_only,
             cloid=Cloid.from_str(cloid),
         )
+        if result.get("status") == "err" and isinstance(result.get("response"), str):
+            return result["response"]
         # A per-order rejection is explicit. An unexpected response stays pending for lookup.
         statuses = result.get("response") if result.get("status") == "ok" else None
         if isinstance(statuses, dict):

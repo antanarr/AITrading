@@ -6,7 +6,7 @@ import httpx
 import pytest
 
 from copybot.autopilot import Journal, Runner, Settings, entry_order
-from copybot.hyperliquid import TradingError
+from copybot.hyperliquid import AccountGateway, TradingError
 from copybot.perps import (
     BAR_MS,
     SENTIMENT_MAX_AGE_MS,
@@ -141,20 +141,23 @@ def setup(tmp_path):
     gateway = Mock()
     feed = Mock()
     feed.book.return_value = BOOK
+    feed.exit_price.return_value = BOOK.bid
     feed.scan.return_value = (
         [Signal(MARKET, True, now_ms() - 5000, Decimal(99), Decimal(100))],
         {},
     )
     gateway.market_state.return_value = None
     gateway.lookup.return_value = None
+    gateway.historical_order.return_value = None
     gateway.flat_market.return_value = True
+    gateway.has_market_fills.return_value = False
     gateway.order.return_value = None
     settings = Settings(markets=["BTC"], max_order_usd="10.10")
     yield Runner(feed, gateway, journal, settings), path
     journal.db.close()
 
 
-def test_entry_timeout_restarts_with_the_same_pending_id(setup):
+def test_entry_timeout_restarts_with_the_same_pending_id(setup, monkeypatch):
     runner, path = setup
     runner.gateway.order.side_effect = httpx.ReadTimeout("timeout")
     with pytest.raises(httpx.ReadTimeout):
@@ -162,11 +165,29 @@ def test_entry_timeout_restarts_with_the_same_pending_id(setup):
     restarted_journal = Journal(path)
     trade = restarted_journal.get("trade")
     restarted = Runner(runner.feed, runner.gateway, restarted_journal, runner.settings)
-    with pytest.raises(TradingError, match="entry is unconfirmed"):
-        restarted.step()
+    assert "Reconciling entry" in restarted.step()
     restarted.gateway.lookup.assert_called_once_with("BTC", trade["entry_id"])
     assert restarted.gateway.order.call_count == 1
+    monkeypatch.setattr("copybot.autopilot.now_ms", lambda: trade["entry_expires"] + 5000)
+    assert "Reconciling entry" in restarted.step()
+    assert "Confirmed flat" in restarted.step()
+    assert restarted_journal.get("trade") is None
+    assert restarted.gateway.order.call_count == 1
     restarted_journal.db.close()
+
+
+def test_missing_order_details_do_not_hide_an_independent_fill(setup, monkeypatch):
+    runner, _ = setup
+    runner.gateway.order.side_effect = httpx.ReadTimeout("unknown submission result")
+    with pytest.raises(httpx.ReadTimeout):
+        runner.step()
+    trade = runner.journal.get("trade")
+    runner.gateway.has_market_fills.return_value = True
+    monkeypatch.setattr("copybot.autopilot.now_ms", lambda: trade["entry_expires"] + 5000)
+    for _ in range(3):
+        assert "Reconciling entry" in runner.step()
+    assert runner.journal.get("trade")["entry_id"] == trade["entry_id"]
+    assert runner.gateway.order.call_count == 1
 
 
 def test_partial_entry_stop_and_take_profit_while_paused(setup):
@@ -176,7 +197,7 @@ def test_partial_entry_stop_and_take_profit_while_paused(setup):
     position = {"szi": "0.05", "entryPx": "100"}
     gateway.lookup.side_effect = lambda coin, cloid: orders.get(cloid)
 
-    def send(coin, buy, size, limit, cloid, *, reduce_only=False, stop=None):
+    def send(coin, buy, size, limit, cloid, *, reduce_only=False, stop=None, expires_at=None):
         assert coin == "BTC"
         if not reduce_only:
             orders[cloid] = {
@@ -209,10 +230,13 @@ def test_partial_entry_stop_and_take_profit_while_paused(setup):
     trade = runner.journal.get("trade")
     assert Decimal(trade["owned_size"]) == Decimal("0.05")
     runner.journal.put("paused", True)
-    runner.feed.book.return_value = Book(
-        Decimal("102"), Decimal("102.02"), Decimal(1), Decimal(1), now_ms()
-    )
+    gateway.market_state.return_value = None
+    assert "Rechecking flat" in runner.step()
+    gateway.cancel.assert_not_called()
+    gateway.market_state.return_value = position
+    runner.feed.exit_price.return_value = Decimal("102")
     assert "take profit" in runner.step()
+    assert "Rechecking flat" in runner.step()
     assert "Canceling" in runner.step()
     gateway.cancel.assert_called_once_with("BTC", trade["stop_id"])
     orders[trade["stop_id"]]["status"] = "canceled"
@@ -225,7 +249,7 @@ def test_stop_rejection_sends_reduce_only_exit(setup):
     gateway = runner.gateway
     position = {"szi": "0.10", "entryPx": "100"}
 
-    def send(coin, buy, size, limit, cloid, *, reduce_only=False, stop=None):
+    def send(coin, buy, size, limit, cloid, *, reduce_only=False, stop=None, expires_at=None):
         if not reduce_only:
             gateway.lookup.return_value = {"status": "filled", "order": {"origSz": str(size)}}
             gateway.market_state.return_value = position
@@ -235,8 +259,107 @@ def test_stop_rejection_sends_reduce_only_exit(setup):
 
     gateway.order.side_effect = send
     assert "protective stop rejected" in runner.step()
-    assert gateway.order.call_args.kwargs == {"reduce_only": True}
+    assert gateway.order.call_args.kwargs["reduce_only"] is True
     assert gateway.order.call_count == 3
+
+
+def test_order_history_recovers_ownership_without_touching_unattributed_exposure(setup):
+    runner, _ = setup
+    gateway = runner.gateway
+    orders = {}
+    gateway.historical_order.side_effect = lambda coin, cloid: orders.get(cloid)
+    gateway.lookup.side_effect = httpx.ReadTimeout("order status unavailable")
+
+    def send(coin, buy, size, limit, cloid, *, reduce_only=False, stop=None, expires_at=None):
+        if not reduce_only:
+            gateway.market_state.return_value = {"szi": "0.05", "entryPx": "100"}
+            raise httpx.ReadTimeout("missing acknowledgement")
+        assert not buy and size == Decimal("0.05") and stop is not None
+        orders[cloid] = {
+            "status": "open",
+            "order": {
+                "reduceOnly": True,
+                "isTrigger": True,
+                "side": "A",
+                "triggerPx": str(stop),
+                "origSz": str(size),
+            },
+        }
+
+    gateway.order.side_effect = send
+    with pytest.raises(httpx.ReadTimeout):
+        runner.step()
+    with pytest.raises(TradingError, match="stop protection is unverified"):
+        runner.step()
+    assert gateway.order.call_count == 1
+    trade = runner.journal.get("trade")
+    orders[trade["entry_id"]] = {
+        "status": "canceled",
+        "order": {
+            "origSz": trade["requested_size"],
+            "sz": str(Decimal(trade["requested_size"]) - Decimal("0.05")),
+        },
+    }
+    assert runner.step() == "Monitoring protected BTC position"
+    assert runner.journal.get("trade")["stop_id"] in orders
+
+
+def test_historical_order_requires_exact_client_id_and_market():
+    feed = Mock()
+    gateway = AccountGateway(feed, "owner", None, None)
+    expected = {"order": {"coin": "BTC", "cloid": "expected"}, "status": "filled"}
+    feed.info.return_value = [
+        {"order": {"coin": "BTC", "cloid": "manual"}},
+        {"order": {"coin": "ETH", "cloid": "expected"}},
+        expected,
+    ]
+    assert gateway.historical_order("BTC", "expected") == expected
+    assert gateway.historical_order("BTC", "unknown") is None
+
+
+def test_emergency_exit_retries_only_after_the_previous_deadline(setup, monkeypatch):
+    runner, _ = setup
+    gateway = runner.gateway
+    orders = {}
+    gateway.lookup.side_effect = lambda coin, cloid: orders.get(cloid)
+    exits = []
+
+    def send(coin, buy, size, limit, cloid, *, reduce_only=False, stop=None, expires_at=None):
+        if not reduce_only:
+            orders[cloid] = {"status": "filled", "order": {"origSz": str(size)}}
+            gateway.market_state.return_value = {"szi": str(size), "entryPx": "100"}
+        elif stop is not None:
+            return "stop rejected"
+        else:
+            assert not buy
+            exits.append((cloid, expires_at))
+            if len(exits) == 1:
+                raise httpx.ReadTimeout("exit acknowledgement missing")
+
+    gateway.order.side_effect = send
+    with pytest.raises(httpx.ReadTimeout):
+        runner.step()
+    assert "Waiting for the previous" in runner.step()
+    assert len(exits) == 1
+    monkeypatch.setattr("copybot.autopilot.now_ms", lambda: exits[0][1] + 5000)
+    assert "Reduce-only exit requested" in runner.step()
+    assert len(exits) == 2 and exits[0][0] != exits[1][0]
+
+
+def test_exit_quote_can_use_a_fresh_one_sided_book(monkeypatch):
+    feed = Feed(Mock())
+    monkeypatch.setattr(
+        feed,
+        "info",
+        lambda *args, **kwargs: {
+            "coin": "BTC",
+            "time": now_ms(),
+            "levels": [[{"px": "100", "sz": "1"}], []],
+        },
+    )
+    assert feed.exit_price("BTC", sell=True) == Decimal(100)
+    with pytest.raises(ValueError, match="No executable side"):
+        feed.exit_price("BTC", sell=False)
 
 
 def test_broker_rejection_does_not_reuse_signal(setup):

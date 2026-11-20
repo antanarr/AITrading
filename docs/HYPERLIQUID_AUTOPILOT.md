@@ -51,11 +51,14 @@ entry and the MetaMask account address bound by the Hyperliquid shortcut.
 outside the repository. `pause` blocks new entries after any in-flight order.
 An open position continues to be managed while paused.
 
-The live SQLite journal records order intent before submission and reconciles
-using client order IDs. If the exchange cannot confirm an order, the worker
-reports it in `status` and waits. Keep the journal when restarting. Check the
-client order ID and position in Hyperliquid before manual intervention. Avoid
-manual orders on the worker's configured markets while it is running.
+The live SQLite journal records order intent and signing deadlines before
+submission. If an entry acknowledgment is missing, the worker checks the client
+order ID in order status and history, and checks fills and current exposure before
+clearing an expired entry as flat. Exposure whose order can't be confirmed needs
+operator review. Exit retries wait for the previous request to settle, and the
+worker checks flatness twice before removing a stop. Keep the journal when
+restarting, and check the order ID and position in Hyperliquid before intervening.
+The worker needs exclusive control of positions on its configured markets while live.
 
 ## Railway
 

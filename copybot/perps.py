@@ -239,10 +239,18 @@ class Feed:
             return {**data, "status": "stale", "observed_at_ms": timestamp}
         return {**data, "status": "unavailable"}
 
-    def book(self, coin):
+    def _book_snapshot(self, coin):
         result = self.info("l2Book", coin=coin)
+        if result["coin"] != coin:
+            raise ValueError(f"Order book returned the wrong market for {coin}")
+        if not -1000 <= now_ms() - result["time"] <= 5000:
+            raise ValueError(f"Stale order book for {coin}")
+        return result
+
+    def book(self, coin):
+        result = self._book_snapshot(coin)
         bids, asks = result["levels"]
-        if result["coin"] != coin or not bids or not asks:
+        if not bids or not asks:
             raise ValueError(f"No two-sided order book for {coin}")
         bid, ask = bids[0], asks[0]
         book = Book(
@@ -254,9 +262,16 @@ class Feed:
         )
         if not 0 < book.bid <= book.ask or min(book.bid_size, book.ask_size) <= 0:
             raise ValueError(f"Invalid order book for {coin}")
-        if not -1000 <= now_ms() - book.timestamp <= 5000:
-            raise ValueError(f"Stale order book for {coin}")
         return book
+
+    def exit_price(self, coin, sell):
+        levels = self._book_snapshot(coin)["levels"][0 if sell else 1]
+        if not levels:
+            raise ValueError(f"No executable side for the exit on {coin}")
+        price = number(levels[0]["px"])
+        if price <= 0 or number(levels[0]["sz"]) <= 0:
+            raise ValueError(f"Invalid executable quote for {coin}")
+        return price
 
     def signal(self, market, observed_at):
         candles = self.info(
