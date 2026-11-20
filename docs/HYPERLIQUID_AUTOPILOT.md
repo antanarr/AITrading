@@ -15,9 +15,10 @@ after the entry fill. The worker checks for a 1.5% take-profit move or a 90-minu
 timeout and exits using reduce-only orders. These prices trigger actions.
 Actual fills, price gaps and fees determine the outcome.
 
-Hyperliquid requires at least $10 of entry notional. The default $10 sizing
-budget is strict and can leave no valid order size after rounding to the market's
-lot size and allowing for price movement. Short orders are sized against the
+Hyperliquid requires at least $10 of entry notional. The worker selects the
+smallest quantity that meets the minimum and applies an $11 sizing cap to
+account for lot sizes and the entry price limit. It skips an entry when the
+smallest valid order exceeds that cap. Short orders are sized against the
 current book and mark because a short can fill above its limit. A better fill
 price can raise the actual short notional above its estimated budget.
 
