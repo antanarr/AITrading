@@ -1,0 +1,9 @@
+**
+!Dockerfile
+!requirements-autopilot.txt
+!copybot/
+!copybot/__init__.py
+!copybot/autopilot.py
+!copybot/hyperliquid.py
+!copybot/models.py
+!copybot/perps.py

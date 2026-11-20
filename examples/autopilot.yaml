@@ -1,0 +1,12 @@
+# Leave owner blank for the Mac Keychain binding. Set the public address for a cloud agent.
+owner:
+markets: [BTC, ETH, SOL, HYPE]
+max_order_usd: '10'
+max_entries_per_day: 3
+min_volume_usd: '10000000'
+max_funding_bps: '2'
+max_spread_bps: '8'
+entry_slippage_bps: '5'
+stop_bps: '75'
+target_bps: '150'
+max_hold_minutes: 90

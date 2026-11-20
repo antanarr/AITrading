@@ -1,5 +1,9 @@
 # AITrading
 
+The [Hyperliquid autopilot](docs/HYPERLIQUID_AUTOPILOT.md) scans perpetuals for
+small longs and shorts and has a separate live execution mode. The rest of
+this README covers the simulated Solana wallet-copying bot.
+
 A personal wallet-copying bot with multiple discovery sources, proportional
 position sizing, and optional AI adjustments. This version trades simulated funds.
 It cannot submit real orders or access a wallet's private keys.
