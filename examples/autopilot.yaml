@@ -3,6 +3,7 @@ owner:
 markets: [BTC, ETH, SOL, HYPE]
 max_order_usd: '11'
 max_entries_per_day: 6
+max_daily_loss_usdc: '2'
 min_volume_usd: '10000000'
 max_funding_bps: '2'
 max_spread_bps: '8'

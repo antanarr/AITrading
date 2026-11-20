@@ -4,7 +4,7 @@ import re
 from decimal import Decimal
 from pathlib import Path
 
-from .perps import API, dex_for, now_ms, number
+from .perps import dex_for, now_ms, number
 
 LOCAL = Path.home() / "Library/Application Support/Codex Hyperliquid"
 KEYCHAIN_SERVICE = "com.antanarr.codex.hyperliquid"
@@ -89,10 +89,37 @@ class AccountGateway:
         )
 
     def has_market_fills(self, coin, since):
+        return bool(self.market_fills(coin, since))
+
+    def market_fills(self, coin, since):
         rows = self.feed.info("userFillsByTime", user=self.owner, startTime=since)
         if len(rows) >= 2000:
             raise TradingError("Fill history is incomplete for order reconciliation")
-        return any(row["coin"] == coin for row in rows)
+        return [row for row in rows if row["coin"] == coin]
+
+    def market_funding(self, coin, since, until):
+        rows = self.feed.info("userFunding", user=self.owner, startTime=since, endTime=until)
+        if len(rows) >= 500:
+            raise TradingError("Funding history is incomplete for P&L reconciliation")
+        funding = {
+            row["hash"]: number(row["delta"]["usdc"])
+            for row in rows
+            if since <= row["time"] <= until and row["delta"]["coin"] == coin
+        }
+        return sum(funding.values(), Decimal(0))
+
+    def configured_exposure(self, markets):
+        exposure = set()
+        for dex in sorted({dex_for(coin) for coin in markets}):
+            state = self.feed.info("clearinghouseState", user=self.owner, dex=dex)
+            exposure.update(
+                row["position"]["coin"]
+                for row in state["assetPositions"]
+                if number(row["position"]["szi"])
+            )
+            orders = self.feed.info("frontendOpenOrders", user=self.owner, dex=dex)
+            exposure.update(order["coin"] for order in orders)
+        return sorted(exposure.intersection(markets))
 
     def lookup(self, coin, cloid):
         row = self.feed.info("orderStatus", user=self.owner, oid=cloid)
@@ -121,7 +148,7 @@ class AccountGateway:
         if dex not in self.exchange:
             self.exchange[dex] = Exchange(
                 self.signer,
-                API,
+                self.feed.api_url,
                 account_address=self.owner,
                 perp_dexs=[dex],
                 timeout=6,
@@ -183,6 +210,56 @@ class AccountGateway:
             if len(statuses) == 1 and isinstance(statuses[0], dict):
                 return statuses[0].get("error")
         return None
+
+    def enter(self, trade):
+        from hyperliquid.utils.types import Cloid
+
+        coin, buy = trade["coin"], trade["long"]
+        size = float(trade["requested_size"])
+        result = self.sdk(coin, trade["entry_expires"]).bulk_orders(
+            [
+                {
+                    "coin": coin,
+                    "is_buy": buy,
+                    "sz": size,
+                    "limit_px": float(trade["limit"]),
+                    "order_type": {"limit": {"tif": "Ioc"}},
+                    "reduce_only": False,
+                    "cloid": Cloid.from_str(trade["entry_id"]),
+                },
+                {
+                    "coin": coin,
+                    "is_buy": not buy,
+                    "sz": size,
+                    "limit_px": float(trade["stop_limit"]),
+                    "reduce_only": True,
+                    "order_type": {
+                        "trigger": {
+                            "isMarket": True,
+                            "triggerPx": float(trade["stop_trigger"]),
+                            "tpsl": "sl",
+                        }
+                    },
+                    "cloid": Cloid.from_str(trade["stop_id"]),
+                },
+            ],
+            grouping="normalTpsl",
+        )
+        if result.get("status") == "err" and isinstance(result.get("response"), str):
+            return {"entry_rejected": result["response"]}
+        body = result.get("response") if result.get("status") == "ok" else None
+        if not isinstance(body, dict):
+            return {}
+        statuses = body.get("data", {}).get("statuses", [])
+        if not statuses or not isinstance(statuses[0], dict):
+            return {}
+        entry = statuses[0]
+        if "error" in entry:
+            return {"entry_rejected": entry["error"]}
+        if "filled" in entry:
+            filled = entry["filled"]
+            return {"entry_oid": filled["oid"], "acknowledged_size": filled["totalSz"]}
+        return {}
 
     def cancel(self, coin, cloid):
         from hyperliquid.utils.types import Cloid

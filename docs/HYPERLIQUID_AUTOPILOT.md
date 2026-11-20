@@ -19,18 +19,23 @@ records include the score, reasons, and source timestamp where available.
 Live entries also require a market on the configured list, a recent order book,
 a spread no wider than 8 basis points, and offered size sufficient for the
 order. Adverse hourly funding above 2 basis points disqualifies the entry.
-The initial policy uses 1x isolated margin, one bot position at a time and up
-to six entry attempts per UTC day. A 0.75% stop is submitted to Hyperliquid
-after the entry fill. The worker checks for a 1.5% take-profit move or a 90-minute
-timeout and exits using reduce-only orders. These prices trigger actions.
-Actual fills, price gaps and fees determine the outcome.
+The trial uses 1x isolated margin, one bot position at a time and up to six entry
+attempts per UTC day. The entry and a reduce-only stop are submitted in one
+exchange request. The stop uses the entry limit to set protection about 0.75%
+away. If Hyperliquid cancels the attached stop on a partial entry, the worker
+checks the filled quantity and attempts to install a stop for that quantity.
+A missing or rejected replacement can trigger a reduce-only exit. The worker
+also exits on a 1.5% favorable move, after 90 minutes, or when a closed post-entry
+candle reverses through the breakout level. Gaps and slippage can move the actual
+exit beyond the trigger.
 
 Hyperliquid requires at least $10 of entry notional. The worker selects the
 smallest quantity that meets the minimum and applies an $11 sizing cap to
 account for lot sizes and the entry price limit. It skips an entry when the
 smallest valid order exceeds that cap. Short orders are sized against the
-current book and mark because a short can fill above its limit. A better fill
-price can raise the actual short notional above its estimated budget.
+current book and mark because a short can fill above its limit. A fast move can
+still lift the actual short notional above the sizing cap. When fills verify
+this happened, the worker attempts to close the position and records an incident.
 
 ## Commands
 
@@ -58,7 +63,17 @@ clearing an expired entry as flat. Exposure whose order can't be confirmed needs
 operator review. Exit retries wait for the previous request to settle, and the
 worker checks flatness twice before removing a stop. Keep the journal when
 restarting, and check the order ID and position in Hyperliquid before intervening.
-The worker needs exclusive control of positions on its configured markets while live.
+The worker matches opening fills to the exchange order ID and checks the
+remaining exposure against the account position. A manual increase or re-entry
+on a configured market pauses fresh entries and raises an incident. Keep manual
+positions separate from this worker's markets while live.
+
+After closure, the journal records USDC P&L using actual entry and exit fills,
+exchange fees, and account funding. It blocks new entries after a **2 USDC**
+realized net loss in one UTC day at the trial setting. An open position can lose
+more during a gap. The worker logs risk incidents to Railway. The Codex alert
+monitor checks for new incidents and missing worker heartbeats every 15 minutes
+while its local execution host is available.
 
 ## Railway
 
@@ -76,6 +91,10 @@ With those files in place, the live worker start command is:
 XDG_STATE_HOME=/data python -m copybot.autopilot --db /data/autopilot.sqlite \
   --config /data/live.yaml --agent-key-file /data/agent.key run --live --interval 300
 ```
+
+For venue verification, pass `--network testnet` before the command and use a
+testnet-approved wallet and a separate journal. Journals are bound to their
+network. Testnet faucet credit and API approval are separate from the funded account.
 
 ETH held in MetaMask needs to be deposited or converted into collateral for
 the chosen markets. A wallet owner must sign the funding transaction. The

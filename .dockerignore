@@ -7,3 +7,4 @@
 !copybot/hyperliquid.py
 !copybot/models.py
 !copybot/perps.py
+!copybot/perp_ledger.py

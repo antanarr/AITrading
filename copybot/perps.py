@@ -11,6 +11,7 @@ import httpx
 BAR_MS = 15 * 60 * 1000
 BPS = Decimal(10000)
 API = "https://api.hyperliquid.xyz"
+TESTNET_API = "https://api.hyperliquid-testnet.xyz"
 SENTIMENT_SOURCE = "https://alternative.me/crypto/fear-and-greed-index/"
 SENTIMENT_API = "https://api.alternative.me/fng/"
 SENTIMENT_MAX_AGE_MS = 36 * 60 * 60 * 1000
@@ -178,14 +179,15 @@ def rank_signal(signal, breadth, sentiment):
 
 
 class Feed:
-    def __init__(self, client):
+    def __init__(self, client, api_url=API):
         self.client = client
+        self.api_url = api_url
         self.sentiment_observation = None
         self.sentiment_retry_ms = 0
         self.sentiment_status = "unavailable"
 
     def info(self, kind, **payload):
-        response = self.client.post(f"{API}/info", json={"type": kind, **payload})
+        response = self.client.post(f"{self.api_url}/info", json={"type": kind, **payload})
         response.raise_for_status()
         return response.json()
 
@@ -284,6 +286,29 @@ class Feed:
             },
         )
         return breakout(market, candles, observed_at)
+
+    def closed_candle(self, coin, bar_start, observed_at):
+        candles = self.info(
+            "candleSnapshot",
+            req={"coin": coin, "interval": "15m", "startTime": bar_start, "endTime": observed_at},
+        )
+        closed = [
+            bar
+            for bar in candles
+            if bar["s"] == coin
+            and bar["i"] == "15m"
+            and bar_start <= bar["t"]
+            and bar["T"] == bar["t"] + BAR_MS - 1
+            and bar["T"] < observed_at
+            and observed_at - bar["T"] <= BAR_MS
+        ]
+        if not closed:
+            return None
+        bar = max(closed, key=lambda item: item["T"])
+        close = number(bar["c"])
+        if close <= 0:
+            raise ValueError("Invalid closed candle price")
+        return bar["T"], close
 
     def scan(self, allowed=(), limit=12, min_volume=Decimal(10_000_000), max_funding_bps=2):
         venues = (
