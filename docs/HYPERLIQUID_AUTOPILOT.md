@@ -10,7 +10,7 @@ Live entries also require a market on the configured list, a recent order book,
 a spread no wider than 8 basis points, and offered size sufficient for the
 order. Adverse hourly funding above 2 basis points disqualifies the entry.
 The initial policy uses 1x isolated margin, one bot position at a time and up
-to three entry attempts per UTC day. A 0.75% stop is submitted to Hyperliquid
+to six entry attempts per UTC day. A 0.75% stop is submitted to Hyperliquid
 after the entry fill. The worker checks for a 1.5% take-profit move or a 90-minute
 timeout and exits using reduce-only orders. These prices trigger actions.
 Actual fills, price gaps and fees determine the outcome.
