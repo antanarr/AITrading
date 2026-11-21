@@ -107,3 +107,10 @@ def test_inverse_volatility_basket_preserves_half_budget_per_side():
     basket = study.choose_baskets(test, 12, 0, gated=False, relative="volatility")
     assert basket.groupby("side").weight.sum().to_dict() == pytest.approx({-1: 0.5, 1: 0.5})
     assert basket.weight.between(0.15, 0.35).all()
+
+
+def test_model_budget_grows_with_equity_and_shrinks_as_volatility_rises():
+    assert study.stake_budget(300, 4, 0.005) == pytest.approx(60)
+    assert study.stake_budget(500, 4, 0.005) == pytest.approx(100)
+    assert study.stake_budget(500, 4, 0.1) == pytest.approx(25)
+    assert study.stake_budget(-1, 4, 0.01) == 0

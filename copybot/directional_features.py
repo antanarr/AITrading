@@ -157,7 +157,9 @@ def _forward_outcomes(hourly: pd.DataFrame, funding: pd.DataFrame) -> pd.DataFra
     return pd.DataFrame(fields, index=hours)
 
 
-def _market_rows(history: MarketHistory, start: int, end: int, minimum_turnover: float):
+def _market_rows(
+    history: MarketHistory, start: int, end: int, minimum_turnover: float, broad: bool
+):
     first = max(0, start - WARMUP_HOURS)
     hourly = _bars(history.bars, first, end)
     hours = hourly.index
@@ -179,7 +181,7 @@ def _market_rows(history: MarketHistory, start: int, end: int, minimum_turnover:
     median_24 = hourly_turnover.rolling(24, min_periods=9).median()
     typical_turnover = median_24.where(~short_history, median_12)
     eligible = (
-        (recent | history.is_meme)
+        (recent | history.is_meme | broad)
         & closed_notional.gt(0)
         & turnover.ge(minimum_turnover)
         & activity.ge(9)
@@ -192,7 +194,7 @@ def _market_rows(history: MarketHistory, start: int, end: int, minimum_turnover:
         {
             "hour": hours,
             "coin": history.coin,
-            "group": "meme" if history.is_meme else "recent",
+            "group": "meme" if history.is_meme else "other",
             "decimals": history.decimals,
             "market_is_meme": int(history.is_meme),
             "market_is_recent": recent.astype(int),
@@ -203,6 +205,7 @@ def _market_rows(history: MarketHistory, start: int, end: int, minimum_turnover:
         index=hours,
     )
     funding = _funding_rows(history, hours)
+    fields.loc[recent & ~fields.market_is_meme.astype(bool), "group"] = "recent"
     return pd.concat(
         [
             fields,
@@ -214,30 +217,31 @@ def _market_rows(history: MarketHistory, start: int, end: int, minimum_turnover:
     ).loc[eligible]
 
 
-def _peers(rows: pd.DataFrame) -> pd.DataFrame:
-    memes = rows.loc[rows["market_is_meme"].eq(1)].set_index("hour")
+def _peers(rows: pd.DataFrame, broad: bool) -> pd.DataFrame:
+    peers = rows if broad else rows.loc[rows["market_is_meme"].eq(1)]
+    peers = peers.set_index("hour")
     market = {}
     for window in PEER_RETURN_WINDOWS:
         column = f"tech_1h_return_{window}"
-        peer_returns = memes[column].dropna().groupby(level=0)
+        peer_returns = peers[column].dropna().groupby(level=0)
         count = peer_returns.count()
         good = count >= MINIMUM_PEERS
         median = peer_returns.median().where(good)
         market[f"market_meme_median_{window}h"] = rows["hour"].map(median)
         market[f"market_meme_breadth_{window}h"] = rows["hour"].map(
-            (memes[column].dropna().gt(0).groupby(level=0).mean()).where(good)
+            (peers[column].dropna().gt(0).groupby(level=0).mean()).where(good)
         )
         market[f"market_relative_return_{window}h"] = rows[column] - rows["hour"].map(median)
         market[f"market_return_rank_{window}h"] = rows.groupby("hour")[column].rank(pct=True)
-    dispersion = memes["tech_1h_return_24"].groupby(level=0)
+    dispersion = peers["tech_1h_return_24"].groupby(level=0)
     market["market_meme_dispersion_24h"] = rows["hour"].map(
         dispersion.std(ddof=0).where(dispersion.count() >= MINIMUM_PEERS)
     )
-    volatility = memes["tech_1h_realized_vol"].groupby(level=0)
+    volatility = peers["tech_1h_realized_vol"].groupby(level=0)
     market["market_meme_realized_vol"] = rows["hour"].map(
         volatility.median().where(volatility.count() >= MINIMUM_PEERS)
     )
-    market["market_meme_count"] = rows["hour"].map(memes.groupby(level=0).size()).fillna(0)
+    market["market_meme_count"] = rows["hour"].map(peers.groupby(level=0).size()).fillna(0)
     market["carry_funding_rank_6h"] = rows.groupby("hour")["carry_funding_mean_6h"].rank(pct=True)
     return pd.concat([rows, pd.DataFrame(market)], axis=1)
 
@@ -248,6 +252,7 @@ def build_frame(
     end: int,
     *,
     minimum_turnover: float = 1_000_000,
+    broad: bool = False,
 ) -> pd.DataFrame:
     """Return one row per eligible decision hour and meme or recent-listing market.
 
@@ -266,14 +271,22 @@ def build_frame(
     for history in histories.values():
         if not history.bars or excluded_symbol(history.coin) or ":" in history.coin:
             continue
-        rows = _market_rows(history, start, end, minimum_turnover)
+        rows = _market_rows(history, start, end, minimum_turnover, broad)
         if rows is not None:
             frames.append(rows)
     if not frames:
-        raise ValueError(
-            "No currently liquid meme or recent-listing decisions in the archive window"
-        )
+        raise ValueError("No eligible liquid market decisions in the archive window")
     market_rows = pd.concat(frames, ignore_index=True).sort_values(
         ["hour", "coin"], ignore_index=True
     )
-    return _peers(market_rows)
+    if not broad:
+        return _peers(market_rows, False)
+    wide = _peers(market_rows, True)
+    # Older research artifacts use meme-specific columns. The broad model records its peer set.
+    return wide.rename(
+        columns={
+            col: col.replace("market_meme_", "market_universe_")
+            for col in wide
+            if col.startswith("market_meme_")
+        }
+    )

@@ -103,3 +103,21 @@ def test_only_liquid_meme_and_recent_markets_enter_peer_features():
     assert first["market_meme_breadth_6h"].eq(1).all()
     assert first[first["coin"].eq("NEW")]["group"].item() == "recent"
     assert first[first["coin"].eq("MEME4")]["market_return_rank_72h"].item() == 1.0
+
+
+def test_broad_universe_uses_liquid_majors_and_excludes_btc_aliases():
+    markets = {
+        name: history(name, is_meme=False, step=step)
+        for name, step in {
+            "ETH": 0.01,
+            "SOL": 0.02,
+            "SUI": -0.01,
+            "HYPE": -0.02,
+            "AAVE": -0.03,
+            "wBTC": 0.5,
+        }.items()
+    }
+    first = build_frame(markets, HOUR, HOUR + 20, broad=True).query("hour == @HOUR")
+    assert set(first.coin) == {"ETH", "SOL", "SUI", "HYPE", "AAVE"}
+    assert first.market_universe_count.eq(5).all()
+    assert first.market_universe_breadth_24h.eq(0.4).all()

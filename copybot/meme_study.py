@@ -171,11 +171,11 @@ def study_period(archive, start, end, selected, minimum_turnover, limits, includ
     }
 
 
-def buy_and_hold(histories, eligible, start, end, limits):
+def buy_and_hold(histories, eligible, start, end, limits, *, meme_only=True):
     coins = [
         coin
         for coin in sorted(eligible)
-        if histories[coin].is_meme
+        if (histories[coin].is_meme or not meme_only)
         and start in histories[coin].bars
         and histories[coin].bars[start].volume > 0
     ]

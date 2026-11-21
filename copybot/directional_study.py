@@ -37,7 +37,8 @@ LOOKBACK_DAYS = 56
 WARMUP_DAYS = 42
 FOLD_DAYS = 14
 INITIAL_EQUITY = 1000
-ORDER_NOTIONAL = 100
+MAX_STAKE_FRACTION = 0.20
+RISK_BUDGET_FRACTION = 0.01
 
 
 @dataclass(frozen=True)
@@ -280,7 +281,12 @@ def choose_signals(test, horizon, policy, phase=0):
     # Complete earlier signals before the next entry, using one global UTC clock.
     grid = test.loc[(test.hour % horizon).eq(phase % horizon)].copy()
     trend = np.sign(grid.tech_1h_return_24.fillna(0))
-    sector = np.sign(grid.market_meme_breadth_24h.fillna(0.5) - 0.5)
+    breadth = (
+        "market_universe_breadth_24h"
+        if "market_universe_breadth_24h" in grid
+        else "market_meme_breadth_24h"
+    )
+    sector = np.sign(grid[breadth].fillna(0.5) - 0.5)
     agreement = trend.eq(sector) & trend.ne(0)
     if policy == "always_long":
         grid["side"] = 1
@@ -344,6 +350,9 @@ def trade_components(row, history, horizon, costs, limit):
     conservative_funding = min(0.0, carry)
     marked = (adverse * (1 - side * exit_impact) - entry) * side * quantity
     marked -= quantity * (entry + adverse) * costs.taker_fee_bps / 10_000
+    breadth = getattr(
+        row, "market_universe_breadth_24h", getattr(row, "market_meme_breadth_24h", np.nan)
+    )
     return {
         "hour": int(row.hour),
         "exit_hour": int(exit_hour),
@@ -356,17 +365,13 @@ def trade_components(row, history, horizon, costs, limit):
         "slippage": friction,
         "net": gross + carry - fees - friction,
         "worst_open_pnl": marked + conservative_funding,
-        "regime": "up"
-        if row.market_meme_breadth_24h >= 0.60
-        else "down"
-        if row.market_meme_breadth_24h <= 0.40
-        else "mixed",
+        "regime": "up" if breadth >= 0.60 else "down" if breadth <= 0.40 else "mixed",
     }
 
 
-def trade_summary(trades):
+def trade_summary(trades, starting_equity=INITIAL_EQUITY):
     days, weeks, coins, regimes = {}, {}, {}, {}
-    peak = equity = INITIAL_EQUITY
+    peak = equity = starting_equity
     drawdown = intrabar_drawdown = 0.0
     nets = [row["net"] for row in trades]
     for row in trades:
@@ -417,13 +422,23 @@ def trade_summary(trades):
     }
 
 
-def replay(picks, histories, horizon, costs):
+def stake_budget(equity, horizon, hourly_volatility):
+    volatility = hourly_volatility * np.sqrt(horizon)
+    fraction = (
+        min(MAX_STAKE_FRACTION, RISK_BUDGET_FRACTION / volatility)
+        if np.isfinite(volatility) and volatility > 0
+        else MAX_STAKE_FRACTION
+    )
+    return float(max(0, equity) * fraction)
+
+
+def replay(picks, histories, horizon, costs, starting_equity=INITIAL_EQUITY):
     trades = []
     unavailable = too_small = 0
-    equity = INITIAL_EQUITY
+    equity = starting_equity
     for row in picks.itertuples():
         # Cap the cost at the current cash balance after earlier positions close.
-        limit = min(ORDER_NOTIONAL, max(0, equity) * 0.98)
+        limit = stake_budget(equity, horizon, row.tech_1h_realized_vol)
         trade = trade_components(row, histories[row.coin], horizon, costs, limit)
         if trade is None:
             unavailable += 1
@@ -434,7 +449,7 @@ def replay(picks, histories, horizon, costs):
         trades.append(trade)
         equity += trade["net"]
     return {
-        **trade_summary(trades),
+        **trade_summary(trades, starting_equity),
         "signals": len(picks),
         "unavailable_outcomes": unavailable,
         "below_minimum": too_small,
@@ -471,12 +486,12 @@ def choose_baskets(test, horizon, phase, gated, relative="raw"):
     return pd.concat(basket_rows) if basket_rows else grid.iloc[:0].assign(side=0)
 
 
-def replay_baskets(picks, histories, horizon, costs):
+def replay_baskets(picks, histories, horizon, costs, starting_equity=INITIAL_EQUITY):
     bets, legs = [], []
     unavailable = too_small = 0
-    equity = INITIAL_EQUITY
+    equity = starting_equity
     for _, basket in picks.groupby("hour"):
-        limit = min(ORDER_NOTIONAL, max(0, equity) * 0.98)
+        limit = stake_budget(equity, horizon, basket.tech_1h_realized_vol.median())
         fills = [
             trade_components(row, histories[row.coin], horizon, costs, limit * row.weight)
             for row in basket.itertuples()
@@ -496,8 +511,8 @@ def replay_baskets(picks, histories, horizon, costs):
         bets.append(trade)
         legs.extend(fills)
         equity += trade["net"]
-    result = trade_summary(bets)
-    coin_stats = trade_summary(legs)
+    result = trade_summary(bets, starting_equity)
+    coin_stats = trade_summary(legs, starting_equity)
     for key in ("best_coin", "net_by_coin", "net_without_best_coin"):
         result[key] = coin_stats[key]
     residual = {row["hour"]: row["net"] for row in bets}
@@ -518,10 +533,11 @@ def replay_baskets(picks, histories, horizon, costs):
 
 
 def basket_reference(frame, histories, first, end):
+    broad = "market_universe_breadth_24h" in frame
     members = [
         histories[coin]
         for coin in frame.loc[frame.hour.eq(first), "coin"]
-        if histories[coin].is_meme and first + 1 in histories[coin].bars
+        if (broad or histories[coin].is_meme) and first + 1 in histories[coin].bars
     ]
     marks = {}
     for day in range(first, end, 24):
@@ -536,11 +552,11 @@ def basket_reference(frame, histories, first, end):
     return pd.Series(marks, dtype=float)
 
 
-def market_sensitivity(trades, benchmark):
+def market_sensitivity(trades, benchmark, starting_equity=INITIAL_EQUITY):
     days = {}
     for row in trades:
         day = row["exit_hour"] // 24
-        days[day] = days.get(day, 0) + row["net"] / INITIAL_EQUITY
+        days[day] = days.get(day, 0) + row["net"] / starting_equity
     realized = pd.Series(days, dtype=float).reindex(benchmark.index, fill_value=0)
     variance = benchmark.var()
     valid = len(benchmark) >= 2 and variance > 0
@@ -554,7 +570,15 @@ def market_sensitivity(trades, benchmark):
 
 
 def run_policy(
-    fold_data, fold_bounds, histories, horizon, policy, phase=0, relative=None, benchmark=None
+    fold_data,
+    fold_bounds,
+    histories,
+    horizon,
+    policy,
+    phase=0,
+    relative=None,
+    benchmark=None,
+    starting_equity=INITIAL_EQUITY,
 ):
     scored = pd.concat(fold_data)
     if policy.startswith("basket"):
@@ -563,8 +587,8 @@ def run_policy(
     else:
         picks = choose_signals(scored, horizon, policy, phase)
         simulate = replay
-    base, _ = simulate(picks, histories, horizon, BASE)
-    stress, trades = simulate(picks, histories, horizon, STRESS)
+    base, _ = simulate(picks, histories, horizon, BASE, starting_equity)
+    stress, trades = simulate(picks, histories, horizon, STRESS, starting_equity)
     individual = []
     for fold in fold_bounds:
         values = [row for row in trades if fold.start <= row["hour"] < fold.end]
@@ -591,11 +615,25 @@ def run_policy(
         "stress_net_second_half": sum(row["net"] for row in trades if row["hour"] >= split),
     }
     if benchmark is not None:
-        result["meme_benchmark_sensitivity"] = market_sensitivity(trades, benchmark)
+        key = (
+            "universe_benchmark_sensitivity"
+            if "market_universe_breadth_24h" in scored
+            else "meme_benchmark_sensitivity"
+        )
+        result[key] = market_sensitivity(trades, benchmark, starting_equity)
     return result
 
 
-def evaluate_mode(frame, histories, boundaries, horizon, mode, tails=False, relative=None):
+def evaluate_mode(
+    frame,
+    histories,
+    boundaries,
+    horizon,
+    mode,
+    tails=False,
+    relative=None,
+    starting_equity=INITIAL_EQUITY,
+):
     columns = market_data(frame, mode)
     scored = {"discovery": [], "validation": []}
     summaries = {"discovery": [], "validation": []}
@@ -628,7 +666,15 @@ def evaluate_mode(frame, histories, boundaries, horizon, mode, tails=False, rela
             "policies": {
                 name: {
                     str(phase): run_policy(
-                        blocks, period_folds, histories, horizon, name, phase, relative, benchmark
+                        blocks,
+                        period_folds,
+                        histories,
+                        horizon,
+                        name,
+                        phase,
+                        relative,
+                        benchmark,
+                        starting_equity,
                     )
                     for phase in (0, horizon // 2)
                 }
@@ -689,9 +735,21 @@ def run(args):
         raise ValueError("Require at least 28 days of training history")
     if not np.isfinite(args.minimum_turnover) or args.minimum_turnover <= 0:
         raise ValueError("Minimum turnover must be positive and finite")
+    if not np.isfinite(args.capital) or args.capital <= 0:
+        raise ValueError("Starting equity must be positive and finite")
     boundaries = list(folds(start, validation, end, args.lookback_days))
     histories, info = load_archive(args.archive, end, include_quarters=True)
-    frame = build_frame(histories, start, end, minimum_turnover=args.minimum_turnover)
+    if args.universe == "broad":
+        from .broad_study import usable_histories
+
+        histories, info["excluded_incomplete_market_data"] = usable_histories(histories, info)
+    frame = build_frame(
+        histories,
+        start,
+        end,
+        minimum_turnover=args.minimum_turnover,
+        broad=args.universe == "broad",
+    )
     if args.context:
         context = pd.DataFrame.from_dict(load_context(args.context, start, end), orient="index")
         if context.empty:
@@ -717,9 +775,11 @@ def run(args):
         "training_lookback_days": args.lookback_days,
         "fold_days": FOLD_DAYS,
         "training_only_warmup_days": WARMUP_DAYS,
-        "initial_equity": INITIAL_EQUITY,
-        "order_notional": ORDER_NOTIONAL,
+        "initial_equity": args.capital,
+        "maximum_stake_fraction": MAX_STAKE_FRACTION,
+        "volatility_budget_fraction": RISK_BUDGET_FRACTION,
         "minimum_turnover": args.minimum_turnover,
+        "universe": args.universe,
         "tail_calibration": args.tails,
         "relative_baskets": relative_target,
         "confidence_cutoff": CONFIDENCE,
@@ -732,13 +792,14 @@ def run(args):
         "models": {},
         "qualification": [],
         "execution": "Next hourly-open proxy, one position, modeled taker fills and hourly funding, fixed horizon.",
-        "equal_weight_meme_buy_hold": {
+        ("equal_weight_buy_hold" if args.universe == "broad" else "equal_weight_meme_buy_hold"): {
             label: buy_and_hold(
                 histories,
                 frame.loc[frame.hour.eq(opening), "coin"],
                 opening + 1,
                 closing,
-                RiskLimits(initial_equity=INITIAL_EQUITY),
+                RiskLimits(initial_equity=args.capital),
+                meme_only=args.universe != "broad",
             )
             for opening, closing, label in (
                 (boundaries[0].start, validation, "discovery"),
@@ -750,7 +811,14 @@ def run(args):
         results = {}
         for mode in modes:
             results[mode] = evaluate_mode(
-                frame, histories, boundaries, horizon, mode, args.tails, relative_target
+                frame,
+                histories,
+                boundaries,
+                horizon,
+                mode,
+                args.tails,
+                relative_target,
+                args.capital,
             )
             summary = results[mode]["validation"]
             print(
@@ -775,6 +843,10 @@ def main(argv=None):
     parser.add_argument("--end", type=date.fromisoformat, default=date(2026, 11, 21))
     parser.add_argument("--lookback-days", type=int, default=LOOKBACK_DAYS)
     parser.add_argument("--minimum-turnover", type=float, default=1_000_000)
+    parser.add_argument("--capital", type=float, default=INITIAL_EQUITY)
+    parser.add_argument(
+        "--universe", choices=("meme-and-recent", "broad"), default="meme-and-recent"
+    )
     parser.add_argument("--modes", nargs="+", choices=tuple(FEATURES))
     parser.add_argument("--horizons", nargs="+", choices=HORIZONS, type=int)
     parser.add_argument(

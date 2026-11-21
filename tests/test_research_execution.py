@@ -29,6 +29,90 @@ def run(market, plan=None, *, end=4, costs=BASE, limits=None):
     )
 
 
+def test_adaptive_sizing_uses_equity_and_withholds_profit_highs():
+    market = history(
+        {0: bar(high=105), 1: bar(low=95), 2: bar(high=105)},
+        quarters=quarter_hour(0, [bar(), bar(high=105), bar(), bar()]),
+    )
+    plan = TradePlan((order(mode="ioc"),), "directional")
+    signals = {hour: [plan] for hour in range(3)}
+    scores = [
+        replay(
+            {market.coin: market},
+            signals,
+            0,
+            3,
+            costs=COSTLESS,
+            limits=RiskLimits(initial_equity=equity, max_leg_fraction=0.25),
+            profit_lock_fraction=0.25,
+        )
+        for equity in (300, 500)
+    ]
+    assert [score["trades"][0]["legs"][0]["size"] for score in scores] == [0.75, 1.25]
+    for score, equity in zip(scores, (300, 500), strict=True):
+        first, second, third = score["trades"]
+        assert second["sizing"]["equity_at_submission"] == pytest.approx(
+            equity + first["net"] * 0.75
+        )
+        assert third["sizing"]["equity_at_submission"] < second["sizing"]["equity_at_submission"]
+        assert third["sizing"]["profit_excluded_from_sizing"] == pytest.approx(first["net"] * 0.25)
+
+
+def test_shared_slots_keep_a_strategy_from_taking_every_position():
+    markets = {coin: history({0: bar(), 1: bar()}, coin) for coin in ("DOGE", "SOL", "ETH")}
+    ideas = {
+        0: [
+            TradePlan((order(coin=coin, mode="ioc"),), label)
+            for coin, label in zip(markets, ("trend", "trend", "reversion"), strict=True)
+        ]
+    }
+    score = replay(
+        markets,
+        ideas,
+        0,
+        2,
+        costs=COSTLESS,
+        limits=RiskLimits(initial_equity=500, max_positions=2, max_leg_fraction=0.25),
+        slots_by_strategy={"trend": 1, "reversion": 1},
+    )
+    assert [trade["label"] for trade in score["trades"]] == ["trend", "reversion"]
+    assert score["submission_diagnostics"]["replay"]["rejected"]["slot_limit"] == 1
+
+
+def test_gap_proxy_is_labeled_and_signal_exit_uses_next_open():
+    market = history({0: bar(), 1: bar(101, 101, 101, 101)})
+    signals = {0: [TradePlan((order(mode="ioc"),), "test")]}
+    proxy = replay(
+        {market.coin: market},
+        signals,
+        0,
+        3,
+        costs=COSTLESS,
+        data_gap_proxy=True,
+        limits=RiskLimits(initial_equity=500),
+    )
+    assert proxy["terminal_proxy_exits"] == 1
+    assert proxy["trades"][0]["legs"][0]["reason"] == "data gap"
+    decisions = []
+
+    def exit_signal(plan, submitted, current):
+        decisions.append((plan.label, submitted, current))
+        return "spread reversion"
+
+    closed = replay(
+        {market.coin: market},
+        signals,
+        0,
+        2,
+        costs=COSTLESS,
+        exit_signal=exit_signal,
+        limits=RiskLimits(initial_equity=500),
+    )
+    assert decisions == [("test", 0, 1)]
+    assert closed["trades"][0]["legs"][0]["exit"] == 101
+    assert closed["trades"][0]["legs"][0]["reason"] == "spread reversion"
+
+
 def test_maker_requires_later_trade_through_and_expires_without_cost():
     market = history({0: bar(low=99), 1: bar(low=100), 2: bar(low=99), 3: bar()})
     for ttl in (0, 1):

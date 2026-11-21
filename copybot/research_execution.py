@@ -301,10 +301,24 @@ def _frames(bet, hour):
 
 
 class _Replay:
-    def __init__(self, histories, costs, limits):
+    def __init__(
+        self,
+        histories,
+        costs,
+        limits,
+        slots_by_strategy=None,
+        exit_signal=None,
+        data_gap_proxy=False,
+        profit_lock_fraction=0.0,
+    ):
         self.histories = histories
         self.costs = costs
         self.limits = limits
+        self.slots_by_strategy = slots_by_strategy or {}
+        self.exit_signal = exit_signal
+        self.data_gap_proxy = data_gap_proxy
+        self.profit_lock_fraction = _number(profit_lock_fraction)
+        self.locked_profit = Fraction(0)
         self.bets = []
         self.trades = []
         self.day_net = defaultdict(float)
@@ -390,8 +404,19 @@ class _Replay:
         if len(reserved) + len(legs) > self.limits.max_positions:
             self.submissions["slot_limit"] += 1
             return
+        if plan.label in self.slots_by_strategy:
+            used = sum(
+                leg.open or leg.pending
+                for bet in self.bets
+                if bet.plan.label == plan.label
+                for leg in bet.legs
+            )
+            if used + len(legs) > self.slots_by_strategy[plan.label]:
+                self.submissions["slot_limit"] += 1
+                return
 
-        equity = self.initial_equity + _number(self.closed_equity)
+        total_equity = self.initial_equity + _number(self.closed_equity)
+        equity = total_equity - self.locked_profit
         amounts = _reserved_notional(reserved) if reserved else empty_book
         unit = sizing.maximum_unit(equity, amounts, self.risk_fraction)
         outcome = sizing.outcome(unit) if equity > 0 else "budget"
@@ -411,6 +436,8 @@ class _Replay:
                 "submitted_hour": hour,
                 "candidate_number": candidate_number,
                 "equity_at_submission": float(equity),
+                "total_equity_at_submission": float(total_equity),
+                "profit_excluded_from_sizing": float(self.locked_profit),
                 "reserved_positions": len(reserved),
                 "reserved_long_notional": float(amounts[1]),
                 "reserved_short_notional": float(amounts[-1]),
@@ -574,7 +601,14 @@ class _Replay:
                 return
         unpriced = [leg.plan.coin for leg in opened if hour not in leg.history.bars]
         if unpriced:
-            raise ValueError(f"Missing execution candle for open positions {unpriced} at {hour}")
+            if not self.data_gap_proxy:
+                raise ValueError(
+                    f"Missing execution candle for open positions {unpriced} at {hour}"
+                )
+            bet.stop_waiting()
+            for leg in opened:
+                self.close(leg, start, leg.last_observed, "data gap", terminal_proxy=True)
+            return
         gaps = sum(leg.pending and hour not in leg.history.bars for leg in bet.legs)
         if gaps:
             self.pending_data_gaps += gaps
@@ -585,6 +619,8 @@ class _Replay:
         for leg in bet.legs:
             if leg.open:
                 self.trail(leg, hour)
+        if self.exit_signal and opened and hour > bet.submitted_hour and bet.exit_next is None:
+            bet.exit_next = self.exit_signal(bet.plan, bet.submitted_hour, hour)
         for left, right, bars in _frames(bet, hour):
             if not any(leg.pending or leg.open for leg in bet.legs):
                 break
@@ -655,6 +691,10 @@ class _Replay:
                     mark_to_market += leg.plan.side * leg.size * (close - leg.entry) - leg.entry_fee
                     mark_to_market += _funding(leg, (hour + 1) * HOUR_MS - 1)
         self.closed_equity = mark_to_market
+        if self.profit_lock_fraction:
+            self.locked_profit = max(
+                self.locked_profit, _number(self.net) * self.profit_lock_fraction
+            )
         self.marked_peak = max(self.marked_peak, mark_to_market)
         self.intrabar_drawdown = max(self.intrabar_drawdown, self.marked_peak - mark_to_market)
 
@@ -724,6 +764,7 @@ def _summarize(engine, hours):
         "zero_volume_submissions": engine.zero_volume_submissions,
         "deferred_exit_slices": engine.deferred_exit_slices,
         "terminal_proxy_exits": engine.terminal_proxy_exits,
+        "profit_excluded_from_sizing_at_end": float(engine.locked_profit),
         "hours_in_market_pct": 100 * len(exposed_hours) / hours if hours else 0,
         "orphans": sum(trade["orphan"] for trade in trades),
         "submission_diagnostics": {
@@ -761,11 +802,30 @@ def replay(
     *,
     costs=BASE,
     limits=RiskLimits(),
+    slots_by_strategy: dict[str, int] | None = None,
+    exit_signal=None,
+    data_gap_proxy: bool = False,
+    profit_lock_fraction: float = 0.0,
 ) -> dict:
     """Submit ideas at their epoch hour and liquidate before the exclusive end hour."""
     if end < start:
         raise ValueError("Replay end precedes the start")
-    engine = _Replay(histories, costs, limits)
+    if slots_by_strategy and any(
+        type(count) is not int or not 1 <= count <= limits.max_positions
+        for count in slots_by_strategy.values()
+    ):
+        raise ValueError("Each strategy needs a positive slot cap within the portfolio limit")
+    if not 0 <= profit_lock_fraction <= 1:
+        raise ValueError("Profit lock fraction must be between zero and one")
+    engine = _Replay(
+        histories,
+        costs,
+        limits,
+        slots_by_strategy,
+        exit_signal,
+        data_gap_proxy,
+        profit_lock_fraction,
+    )
     for hour in range(start, end):
         if engine.bets or hour in ideas:
             engine.hour(ideas.get(hour, ()), hour, end)
