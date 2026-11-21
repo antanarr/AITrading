@@ -111,9 +111,8 @@ require the results to hold after costs without relying on its best trade.
 - **Portfolio.** BTC, ETH, SOL and HYPE perps, one position, trial-sized orders
   around 10 USDC with an 11 USDC cap and current lot sizes. Same daily limits
   across rules. The slower rules skip trades with initial stops outside
-  0.5% to 4%. The deployed ranker also uses four liquid peers for breadth and
-  the prior day's Bitcoin Fear & Greed reading. Live breadth and sentiment
-  availability can differ. [Alternative.me Crypto Fear & Greed Index](https://alternative.me/crypto/fear-and-greed-index/)
+  0.5% to 4%. The historical ranker used four liquid peers for breadth and
+  an external input removed from the current research harness.
 - **Costs.** Use the documented 4.5-basis-point base taker fee on each side and
   actual historical hourly funding rates with the preceding candle close as
   a price proxy. Base spread and impact total roughly 5 basis points round
@@ -149,5 +148,7 @@ python -m copybot.strategy_study state/backruns/2026-11-20-strategy \
   --end-date 2026-11-20 --starting-usdc 46.935912
 ```
 
-The command writes `study-results.json` with both cost models, each time
-partition, individual trades, and breakdowns by coin, side, week and exit.
+This command is available in archived commit `e4aa566`. It writes
+`study-results.json` with both cost models, each time partition, individual
+trades, and breakdowns by coin, side, week and exit. Use the
+[current market research harness](HYPERLIQUID_MEME_STUDY.md) for new tests.

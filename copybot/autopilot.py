@@ -20,6 +20,7 @@ from .hyperliquid import AccountGateway, TradingError, load_signer
 from .models import Model, Positive
 from .perp_ledger import ExposureConflict, reconstruct
 from .perps import API, BAR_MS, BPS, TESTNET_API, Feed, now_ms, number, round_price
+from .research_models import excluded_symbol
 
 MIN_NOTIONAL = Decimal(10)
 ACTION_TTL_MS = 10_000
@@ -42,7 +43,7 @@ CLOSED = {
 
 class Settings(Model):
     owner: str | None = None
-    markets: list[str] = Field(min_length=1, max_length=12)
+    markets: list[str] = Field(min_length=1)
     max_order_usd: Positive = Field(ge=10)
     max_entries_per_day: int = Field(default=3, ge=1, le=24)
     max_daily_loss_usdc: Positive = Decimal("2")
@@ -220,11 +221,12 @@ def protection_prices(reference, *, long, decimals, stop_bps):
 
 
 class Runner:
-    def __init__(self, feed, gateway, journal, settings):
+    def __init__(self, feed, gateway, journal, settings, *, entries_enabled=False):
         self.feed = feed
         self.gateway = gateway
         self.journal = journal
         self.settings = settings
+        self.entries_enabled = entries_enabled
 
     def lookup(self, coin, cloid):
         try:
@@ -279,6 +281,8 @@ class Runner:
             return self.manage(trade)
         if self.journal.get("paused", False):
             return "Entries paused"
+        if not self.entries_enabled:
+            return "Entries disabled until a strategy qualifies"
         cfg = self.settings
         day = utc_day()
         if number(self.journal.get("daily_pnl_usdc", {}).get(day, "0")) <= -cfg.max_daily_loss_usdc:
@@ -295,6 +299,8 @@ class Runner:
             if signal.bar_end <= self.journal.get("last_bar", 0):
                 continue
             coin = signal.market.coin
+            if excluded_symbol(coin):
+                continue
             if not self.gateway.flat_market(coin):
                 continue
             if entry_order(signal, self.feed.book(coin), cfg) is None:
@@ -575,6 +581,14 @@ def scan_result(feed):
                 "bar_end_ms": row.bar_end,
                 "breakout_price": row.trigger,
                 "close": row.close,
+                "open_interest": row.market.open_interest,
+                "oracle_price": row.market.oracle,
+                "mark_price": row.market.mark,
+                "premium": row.market.premium,
+                "impact_bid": row.market.impact_bid,
+                "impact_ask": row.market.impact_ask,
+                "funding_per_hour": row.market.funding,
+                "day_notional_volume": row.market.volume,
                 **row.evidence(),
             }
             for row in signals

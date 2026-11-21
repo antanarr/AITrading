@@ -6,15 +6,13 @@ from decimal import ROUND_DOWN, Decimal, DecimalException
 from statistics import median
 from time import time_ns
 
-import httpx
+from .research_models import DAY_HOURS, HOUR_MS, excluded_symbol
 
-BAR_MS = 15 * 60 * 1000
+BAR_MS = HOUR_MS // 4
+CANDLE_INTERVALS = {"15m": BAR_MS, "1h": HOUR_MS, "4h": 4 * HOUR_MS, "1d": DAY_HOURS * HOUR_MS}
 BPS = Decimal(10000)
 API = "https://api.hyperliquid.xyz"
 TESTNET_API = "https://api.hyperliquid-testnet.xyz"
-SENTIMENT_SOURCE = "https://alternative.me/crypto/fear-and-greed-index/"
-SENTIMENT_API = "https://api.alternative.me/fng/"
-SENTIMENT_MAX_AGE_MS = 36 * 60 * 60 * 1000
 
 
 def now_ms():
@@ -55,6 +53,13 @@ class Market:
     funding: Decimal
     mark: Decimal
     change_24h: Decimal | None = None
+    open_interest: Decimal | None = None
+    oracle: Decimal | None = None
+    premium: Decimal | None = None
+    impact_bid: Decimal | None = None
+    impact_ask: Decimal | None = None
+    mid: Decimal | None = None
+    volume_base: Decimal | None = None
 
 
 @dataclass(frozen=True)
@@ -132,6 +137,7 @@ def market_breadth(markets, min_volume):
         market.change_24h
         for market in markets
         if not dex_for(market.coin)
+        and not excluded_symbol(market.coin)
         and market.volume >= min_volume
         and market.change_24h is not None
     ]
@@ -142,7 +148,7 @@ def market_breadth(markets, min_volume):
     }
 
 
-def rank_signal(signal, breadth, sentiment):
+def rank_signal(signal, breadth):
     score = 0
     factors = []
     ratio = signal.relative_volume
@@ -153,7 +159,7 @@ def rank_signal(signal, breadth, sentiment):
         score -= 1
         factors.append("Breakout volume is below 0.75x its recent median")
 
-    # Native crypto perps share the breadth and BTC sentiment context. Builder markets may track stocks.
+    # Builder markets may track assets outside the native crypto market.
     if not dex_for(signal.market.coin):
         total = breadth["total"]
         aligned, opposed = ("advancing", "declining") if signal.long else ("declining", "advancing")
@@ -163,14 +169,6 @@ def rank_signal(signal, breadth, sentiment):
         elif total >= 5 and breadth[opposed] * 5 >= 3 * total:
             score -= 1
             factors.append("Broad crypto market move opposes this direction")
-        index = sentiment.get("index")
-        # Use only extreme readings and give them less weight than volume confirmation.
-        if index is not None and (index <= 25 or index >= 75):
-            score += 1 if signal.long == (index >= 75) else -1
-            factors.append(
-                f"Bitcoin Fear & Greed is {'high' if index >= 75 else 'low'} (Alternative.me)"
-            )
-
     direction_funding = (signal.market.funding if signal.long else -signal.market.funding) * BPS
     if direction_funding >= Decimal("0.5"):
         score -= 1
@@ -182,9 +180,6 @@ class Feed:
     def __init__(self, client, api_url=API):
         self.client = client
         self.api_url = api_url
-        self.sentiment_observation = None
-        self.sentiment_retry_ms = 0
-        self.sentiment_status = "unavailable"
 
     def info(self, kind, **payload):
         response = self.client.post(f"{self.api_url}/info", json={"type": kind, **payload})
@@ -195,51 +190,70 @@ class Feed:
         meta, contexts = self.info("metaAndAssetCtxs", dex=dex)
         result = {}
         for asset, context in zip(meta["universe"], contexts, strict=True):
-            if asset.get("isDelisted") or not context.get("midPx"):
+            if not isinstance(asset, dict) or not isinstance(context, dict):
                 continue
-            coin = asset["name"]
+            coin, decimals = asset.get("name"), asset.get("szDecimals")
+            if (
+                asset.get("isDelisted")
+                or not isinstance(coin, str)
+                or not coin
+                or excluded_symbol(coin)
+                or type(decimals) is not int
+                or not 0 <= decimals <= 6
+            ):
+                continue
+            mid = optional_number(context.get("midPx"))
+            mark = optional_number(context.get("markPx"))
+            volume = optional_number(context.get("dayNtlVlm"))
+            funding = optional_number(context.get("funding"))
+            if (
+                mid is None
+                or mid <= 0
+                or mark is None
+                or mark <= 0
+                or volume is None
+                or volume < 0
+                or funding is None
+            ):
+                continue
             previous = optional_number(context.get("prevDayPx"))
-            mid = optional_number(context["midPx"])
+            impacts = context.get("impactPxs")
+            bid = ask = None
+            if isinstance(impacts, list) and len(impacts) == 2:
+                bid, ask = (optional_number(price) for price in impacts)
+                if bid is None or ask is None or not 0 < bid <= ask:
+                    bid = ask = None
             result[coin] = Market(
                 coin,
-                asset["szDecimals"],
-                number(context["dayNtlVlm"]),
-                number(context["funding"]),
-                number(context["markPx"]),
-                mid / previous - 1 if mid and mid > 0 and previous and previous > 0 else None,
+                decimals,
+                volume,
+                funding,
+                mark,
+                mid / previous - 1 if previous is not None and previous > 0 else None,
+                open_interest=optional_number(context.get("openInterest")),
+                oracle=optional_number(context.get("oraclePx")),
+                premium=optional_number(context.get("premium")),
+                impact_bid=bid,
+                impact_ask=ask,
+                mid=mid,
+                volume_base=optional_number(context.get("dayBaseVlm")),
             )
         return result
 
-    def fear_and_greed(self, observed_at):
-        if observed_at >= self.sentiment_retry_ms:
-            self.sentiment_retry_ms = observed_at + 5 * 60 * 1000
-            try:
-                response = self.client.get(SENTIMENT_API, timeout=2.5)
-                response.raise_for_status()
-                body = response.json()
-                if body["metadata"]["error"]:
-                    raise ValueError("Sentiment source reported an error")
-                row = body["data"][0]
-                index = int(str(row["value"]))
-                timestamp = int(str(row["timestamp"])) * 1000
-                if not 0 <= index <= 100 or not 0 < timestamp <= observed_at:
-                    raise ValueError("Invalid Fear & Greed observation")
-                if self.sentiment_observation and timestamp < self.sentiment_observation[1]:
-                    raise ValueError("Fear & Greed observation moved backward")
-                self.sentiment_observation = (index, timestamp)
-                self.sentiment_status = "current"
-                self.sentiment_retry_ms = observed_at + 60 * 60 * 1000
-            except (httpx.HTTPError, ValueError, IndexError, KeyError, TypeError):
-                self.sentiment_status = "unavailable"
+    def candles(self, coin, interval, start_ms, end_ms):
+        """Fetch exchange candles for the requested timestamp range."""
+        if interval not in CANDLE_INTERVALS or start_ms > end_ms:
+            raise ValueError("Invalid Hyperliquid candle interval or timestamps")
+        return self.info(
+            "candleSnapshot",
+            req={"coin": coin, "interval": interval, "startTime": start_ms, "endTime": end_ms},
+        )
 
-        data = {"source": "Alternative.me", "source_url": SENTIMENT_SOURCE}
-        if self.sentiment_observation:
-            index, timestamp = self.sentiment_observation
-            if 0 <= observed_at - timestamp <= SENTIMENT_MAX_AGE_MS:
-                status = "current" if self.sentiment_status == "current" else "cached"
-                return {**data, "status": status, "index": index, "observed_at_ms": timestamp}
-            return {**data, "status": "stale", "observed_at_ms": timestamp}
-        return {**data, "status": "unavailable"}
+    def funding_history(self, coin, start_ms, end_ms):
+        """Fetch a page of hourly funding observations with inclusive endpoints."""
+        if start_ms > end_ms:
+            raise ValueError("Invalid Hyperliquid funding timestamps")
+        return self.info("fundingHistory", coin=coin, startTime=start_ms, endTime=end_ms)
 
     def _book_snapshot(self, coin):
         result = self.info("l2Book", coin=coin)
@@ -276,22 +290,11 @@ class Feed:
         return price
 
     def signal(self, market, observed_at):
-        candles = self.info(
-            "candleSnapshot",
-            req={
-                "coin": market.coin,
-                "interval": "15m",
-                "startTime": observed_at - 26 * BAR_MS,
-                "endTime": observed_at,
-            },
-        )
+        candles = self.candles(market.coin, "15m", observed_at - 26 * BAR_MS, observed_at)
         return breakout(market, candles, observed_at)
 
     def closed_candle(self, coin, bar_start, observed_at):
-        candles = self.info(
-            "candleSnapshot",
-            req={"coin": coin, "interval": "15m", "startTime": bar_start, "endTime": observed_at},
-        )
+        candles = self.candles(coin, "15m", bar_start, observed_at)
         closed = [
             bar
             for bar in candles
@@ -310,17 +313,14 @@ class Feed:
             raise ValueError("Invalid closed candle price")
         return bar["T"], close
 
-    def scan(self, allowed=(), limit=12, min_volume=Decimal(10_000_000), max_funding_bps=2):
-        venues = (
-            sorted({"", *(dex_for(coin) for coin in allowed)})
-            if allowed
-            else [row["name"] if row else "" for row in self.info("perpDexs")]
-        )
+    def scan(self, allowed=(), min_volume=Decimal(10_000_000), max_funding_bps=2):
+        venues = sorted({"", *(dex_for(coin) for coin in allowed if not excluded_symbol(coin))})
         with ThreadPoolExecutor(max_workers=6) as pool:
             markets = {
                 coin: asset
                 for group in pool.map(self.markets, venues)
                 for coin, asset in group.items()
+                if not excluded_symbol(asset.coin)
             }
             eligible = sorted(
                 (
@@ -329,14 +329,12 @@ class Feed:
                     if asset.volume >= min_volume and (not allowed or asset.coin in allowed)
                 ),
                 key=lambda asset: (-asset.volume, asset.coin),
-            )[:limit]
+            )
             observed_at = now_ms()
-            sentiment_task = pool.submit(self.fear_and_greed, observed_at)
             signals = list(pool.map(lambda asset: self.signal(asset, observed_at), eligible))
-            sentiment = sentiment_task.result()
         breadth = market_breadth(markets.values(), min_volume)
         ranked = [
-            rank_signal(signal, breadth, sentiment)
+            rank_signal(signal, breadth)
             for signal in signals
             if signal
             and (signal.market.funding if signal.long else -signal.market.funding) * BPS
@@ -347,8 +345,5 @@ class Feed:
             "venues": len(venues),
             "markets": len(markets),
             "evaluated": len(eligible),
-            "market_context": {
-                "native_perp_breadth_24h": breadth,
-                "bitcoin_fear_and_greed": sentiment,
-            },
+            "market_context": {"native_perp_breadth_24h": breadth},
         }

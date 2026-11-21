@@ -10,7 +10,6 @@ from copybot.hyperliquid import AccountGateway, TradingError
 from copybot.perp_ledger import ExposureConflict
 from copybot.perps import (
     BAR_MS,
-    SENTIMENT_MAX_AGE_MS,
     Book,
     Feed,
     Market,
@@ -22,7 +21,7 @@ from copybot.perps import (
     round_price,
 )
 
-MARKET = Market("BTC", 5, Decimal("100000000"), Decimal(0), Decimal("100"))
+MARKET = Market("DOGE", 5, Decimal("100000000"), Decimal(0), Decimal("100"))
 BOOK = Book(Decimal("99.99"), Decimal("100.01"), Decimal(1), Decimal(1), now_ms())
 
 
@@ -33,7 +32,7 @@ def test_breakout_uses_only_completed_contiguous_bars(long):
         close = 100 if index != 23 else (103 if long else 97)
         bars.append(
             {
-                "s": "BTC",
+                "s": "DOGE",
                 "i": "15m",
                 "t": index * BAR_MS,
                 "T": (index + 1) * BAR_MS - 1,
@@ -50,49 +49,18 @@ def test_breakout_uses_only_completed_contiguous_bars(long):
     assert breakout(MARKET, bars[1:], 24 * BAR_MS + 10) is None
 
 
-def test_sentiment_refresh_uses_recent_cache_and_rejects_expired_readings():
-    timestamp = 1_800_000_000_000
-    requested = []
-
-    def respond(request):
-        requested.append(request.url.host)
-        if len(requested) > 1:
-            return httpx.Response(503)
-        return httpx.Response(
-            200,
-            json={
-                "metadata": {"error": None},
-                "data": [
-                    {"value": "18", "timestamp": str(timestamp // 1000)},
-                ],
-            },
-        )
-
-    with httpx.Client(transport=httpx.MockTransport(respond)) as client:
-        feed = Feed(client)
-        current = feed.fear_and_greed(timestamp)
-        assert current["index"] == 18 and current["source"] == "Alternative.me"
-        assert feed.fear_and_greed(timestamp + 60_000) == current
-        cached = feed.fear_and_greed(timestamp + 60 * 60 * 1000)
-        assert cached["status"] == "cached" and cached["index"] == 18
-        stale = feed.fear_and_greed(timestamp + SENTIMENT_MAX_AGE_MS + 1)
-        assert stale["status"] == "stale" and "index" not in stale
-        assert requested == ["api.alternative.me"] * 3
-
-
 def test_crypto_context_applies_to_native_perps_only():
     markets = [
         replace(MARKET, coin=coin, change_24h=Decimal("-0.02"))
-        for coin in ("BTC", "ETH", "SOL", "HYPE", "XRP")
+        for coin in ("DOGE", "ETH", "SOL", "HYPE", "XRP")
     ]
     builder = replace(MARKET, coin="xyz:XYZ100", change_24h=Decimal("0.03"))
     breadth = market_breadth([*markets, builder], min_volume=10_000_000)
     assert breadth == {"advancing": 0, "declining": 5, "total": 5}
     native_short = Signal(markets[0], False, 1, Decimal(100), Decimal(99), Decimal("1.8"))
     builder_short = replace(native_short, market=builder)
-    assert rank_signal(native_short, breadth, {"index": 18}).score == 4
-    assert rank_signal(builder_short, breadth, {"index": 18}).score == 2
-    assert rank_signal(native_short, breadth, {"status": "unavailable"}).score == 3
+    assert rank_signal(native_short, breadth).score == 3
+    assert rank_signal(builder_short, breadth).score == 2
 
 
 def test_scan_prioritizes_ranked_signals_and_keeps_existing_funding_limit(monkeypatch):
@@ -104,7 +72,6 @@ def test_scan_prioritizes_ranked_signals_and_keeps_existing_funding_limit(monkey
         "markets",
         lambda dex: {asset.coin: asset for asset in (MARKET, high_volume, expensive)},
     )
-    monkeypatch.setattr(feed, "fear_and_greed", lambda observed_at: {"status": "unavailable"})
     monkeypatch.setattr(
         feed,
         "signal",
@@ -117,8 +84,8 @@ def test_scan_prioritizes_ranked_signals_and_keeps_existing_funding_limit(monkey
             Decimal("0.5") if asset == high_volume else Decimal(2),
         ),
     )
-    signals, scan = feed.scan(allowed=["BTC", "ETH", "HYPE"])
-    assert [signal.market.coin for signal in signals] == ["BTC", "ETH"]
+    signals, scan = feed.scan(allowed=["DOGE", "ETH", "HYPE"])
+    assert [signal.market.coin for signal in signals] == ["DOGE", "ETH"]
     assert scan["evaluated"] == 3
     assert signals[0].evidence()["breakout_volume_vs_median"] == "2.00"
 
@@ -126,13 +93,30 @@ def test_scan_prioritizes_ranked_signals_and_keeps_existing_funding_limit(monkey
 @pytest.mark.parametrize("long", [True, False])
 def test_sizing_respects_tick_minimum_and_configured_budget(long):
     signal = Signal(MARKET, long, now_ms() - 5000, Decimal(99 if long else 101), Decimal(100))
-    assert entry_order(signal, BOOK, Settings(markets=["BTC"], max_order_usd=10)) is None
-    size, limit = entry_order(signal, BOOK, Settings(markets=["BTC"], max_order_usd="10.10"))
+    assert entry_order(signal, BOOK, Settings(markets=["DOGE"], max_order_usd=10)) is None
+    size, limit = entry_order(signal, BOOK, Settings(markets=["DOGE"], max_order_usd="10.10"))
     quote = BOOK.ask if long else BOOK.bid
     assert size * min(quote, limit) >= 10
     assert size * max(quote, limit, MARKET.mark) <= Decimal("10.10")
     assert size.as_tuple().exponent == -5
     assert round_price(limit, 5) == limit
+
+
+def test_watchlist_can_exceed_twelve_markets():
+    settings = Settings(markets=[f"ALT{index}" for index in range(20)], max_order_usd=20)
+    assert len(settings.markets) == 20
+
+
+def test_production_runner_blocks_unqualified_fresh_entries(tmp_path):
+    journal = Journal(tmp_path / "operational.sqlite")
+    feed, gateway = Mock(), Mock()
+    try:
+        runner = Runner(feed, gateway, journal, Settings(markets=["DOGE"], max_order_usd=20))
+        assert runner.step() == "Entries disabled until a strategy qualifies"
+        feed.scan.assert_not_called()
+        gateway.enter.assert_not_called()
+    finally:
+        journal.db.close()
 
 
 @pytest.fixture
@@ -158,8 +142,8 @@ def setup(tmp_path):
     gateway.market_funding.return_value = Decimal(0)
     gateway.enter.return_value = {}
     gateway.order.return_value = None
-    settings = Settings(markets=["BTC"], max_order_usd="10.10")
-    yield Runner(feed, gateway, journal, settings), path
+    settings = Settings(markets=["DOGE"], max_order_usd="10.10")
+    yield Runner(feed, gateway, journal, settings, entries_enabled=True), path
     journal.db.close()
 
 
@@ -214,7 +198,7 @@ def test_entry_timeout_restarts_with_the_same_pending_id(setup, monkeypatch):
     assert trade["stop_id"]
     restarted = Runner(runner.feed, runner.gateway, restarted_journal, runner.settings)
     assert "Reconciling entry" in restarted.step()
-    restarted.gateway.lookup.assert_called_once_with("BTC", trade["entry_id"])
+    restarted.gateway.lookup.assert_called_once_with("DOGE", trade["entry_id"])
     monkeypatch.setattr("copybot.autopilot.now_ms", lambda: trade["entry_expires"] + 5000)
     assert "Reconciling entry" in restarted.step()
     assert "Confirmed flat" in restarted.step()
@@ -245,7 +229,7 @@ def test_partial_entry_replaces_canceled_stop_and_books_net_pnl_while_paused(set
     filled_ms = now_ms()
 
     def send(coin, buy, size, limit, cloid, *, reduce_only=False, stop=None, expires_at=None):
-        assert coin == "BTC" and not buy and reduce_only and size == Decimal("0.05")
+        assert coin == "DOGE" and not buy and reduce_only and size == Decimal("0.05")
         if stop is not None:
             orders[cloid] = open_stop(stop, size)
         else:
@@ -256,7 +240,7 @@ def test_partial_entry_replaces_canceled_stop_and_books_net_pnl_while_paused(set
             )
 
     gateway.order.side_effect = send
-    assert runner.step() == "Monitoring protected BTC position"
+    assert runner.step() == "Monitoring protected DOGE position"
     trade = runner.journal.get("trade")
     assert trade["standalone_stop"] and trade["attached_stop_id"] != trade["stop_id"]
     runner.journal.put("paused", True)
@@ -268,12 +252,12 @@ def test_partial_entry_replaces_canceled_stop_and_books_net_pnl_while_paused(set
     assert "take profit" in runner.step()
     assert "Rechecking flat" in runner.step()
     assert "Canceling" in runner.step()
-    gateway.cancel.assert_called_once_with("BTC", trade["stop_id"])
+    gateway.cancel.assert_called_once_with("DOGE", trade["stop_id"])
     orders[trade["stop_id"]]["status"] = "canceled"
     gateway.market_funding.return_value = Decimal("-0.006")
     monkeypatch.setattr("copybot.autopilot.now_ms", lambda: filled_ms + 7000)
     result = runner.step()
-    assert result["result"] == "Confirmed flat on BTC"
+    assert result["result"] == "Confirmed flat on DOGE"
     assert Decimal(result["pnl"]["net_usdc"]) == Decimal("0.091")
     assert Decimal(runner.journal.status()["daily_net_pnl_usdc"]) == Decimal("0.091")
     assert runner.step() == "Entries paused"
@@ -306,7 +290,7 @@ def test_ownership_recovered_from_order_history_after_crash(setup):
             "oid": 101,
         },
     }
-    assert runner.step() == "Monitoring protected BTC position"
+    assert runner.step() == "Monitoring protected DOGE position"
     gateway.order.assert_not_called()
     assert runner.journal.get("trade")["entry_oid"] == 101
 
@@ -314,14 +298,14 @@ def test_ownership_recovered_from_order_history_after_crash(setup):
 def test_historical_order_requires_exact_client_id_and_market():
     feed = Mock()
     gateway = AccountGateway(feed, "owner", None, None)
-    expected = {"order": {"coin": "BTC", "cloid": "expected"}, "status": "filled"}
+    expected = {"order": {"coin": "DOGE", "cloid": "expected"}, "status": "filled"}
     feed.info.return_value = [
-        {"order": {"coin": "BTC", "cloid": "manual"}},
+        {"order": {"coin": "DOGE", "cloid": "manual"}},
         {"order": {"coin": "ETH", "cloid": "expected"}},
         expected,
     ]
-    assert gateway.historical_order("BTC", "expected") == expected
-    assert gateway.historical_order("BTC", "unknown") is None
+    assert gateway.historical_order("DOGE", "expected") == expected
+    assert gateway.historical_order("DOGE", "unknown") is None
 
 
 def test_emergency_exit_retries_only_after_the_previous_deadline(setup, monkeypatch):
@@ -356,20 +340,20 @@ def test_exit_quote_can_use_a_fresh_one_sided_book(monkeypatch):
         feed,
         "info",
         lambda *args, **kwargs: {
-            "coin": "BTC",
+            "coin": "DOGE",
             "time": now_ms(),
             "levels": [[{"px": "100", "sz": "1"}], []],
         },
     )
-    assert feed.exit_price("BTC", sell=True) == Decimal(100)
+    assert feed.exit_price("DOGE", sell=True) == Decimal(100)
     with pytest.raises(ValueError, match="No executable side"):
-        feed.exit_price("BTC", sell=False)
+        feed.exit_price("DOGE", sell=False)
 
 
 def test_broker_rejection_does_not_reuse_signal(setup):
     runner, _ = setup
     runner.gateway.enter.return_value = {"entry_rejected": "IOC did not execute"}
-    assert runner.step() == "No fill on BTC"
+    assert runner.step() == "No fill on DOGE"
     assert runner.step()["result"] == "No eligible entry"
     assert runner.gateway.enter.call_count == 1
 
@@ -379,7 +363,7 @@ def test_manual_reentry_at_same_size_and_price_blocks_orders(setup):
     gateway = runner.gateway
     orders = {}
     enter_fixture(gateway, orders)
-    assert runner.step() == "Monitoring protected BTC position"
+    assert runner.step() == "Monitoring protected DOGE position"
     size = gateway.market_state.return_value["szi"]
     gateway.market_fills.return_value.extend(
         [
@@ -397,7 +381,7 @@ def test_failed_breakout_uses_a_closed_post_entry_candle(setup, monkeypatch):
     runner, _ = setup
     orders = {}
     enter_fixture(runner.gateway, orders)
-    assert runner.step() == "Monitoring protected BTC position"
+    assert runner.step() == "Monitoring protected DOGE position"
     trade = runner.journal.get("trade")
     tick = (trade["opened"] // BAR_MS + 1) * BAR_MS
     monkeypatch.setattr("copybot.autopilot.now_ms", lambda: tick + 1)

@@ -1,6 +1,6 @@
 # Leave owner blank for the Mac Keychain binding. Set the public address for a cloud agent.
 owner:
-markets: [BTC, ETH, SOL, HYPE]
+markets: [DOGE, kPEPE, FARTCOIN]
 max_order_usd: '11'
 max_entries_per_day: 6
 max_daily_loss_usdc: '2'
