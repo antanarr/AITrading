@@ -202,9 +202,30 @@ The passive audit uses 16-minute anchors to keep horizons from overlapping
 for each coin. Each quote rests for 60 seconds. It can only fill on a
 subsequent opposite-side trade strictly through the quoted price after a
 250 ms modeled activation delay. The primary metric is the executable
-five-minute round-trip markout at recorded quotes after entry and exit
-fees. Entry-to-mid markout, one- and 15-minute horizons, fill rates,
-and day and market breakdowns are recorded separately.
+five-minute round-trip markout after entry and exit fees. Exit fills walk
+recorded bid or ask depth for the full position. The report also includes
+entry-to-mid markout, one- and 15-minute horizons, fill rates, and
+breakdowns by day and market.
+
+Three conditional screens run alongside the unconditional quote baseline.
+They scan on UTC minute boundaries, use data available by the decision
+time, and allow one trigger per coin and signal per 16-minute window.
+
+| Screen | Fixed entry observation |
+| --- | --- |
+| Flow plus depth continuation | In the preceding 60 seconds, at least 2,500 USDC of aggressor flow with signed imbalance of at least 0.50 in magnitude. Top-five bid/ask depth imbalance must be at least 0.20 in the same direction. |
+| Open-interest flush | Buy after a five-minute mark price decline of at least 1.75%, open interest down at least 3%, and mark at least 10 bps below oracle. |
+| Premium fade | Fade mark relative to oracle at a distance of at least 20 bps on either side. |
+
+The open-interest and premium rules require market context no more than
+75 seconds old. The REST snapshot has a receive time. Book and trade
+events also have an exchange time, and the audit checks both clocks.
+Conditional candidates need at least 500 distinct eligible
+anchors, greater than +3 bps mean executable five-minute net markout, a
+positive lower confidence bound after resampling UTC days, and positive
+results across at least four markets. Sparse signals are reported as
+insufficient evidence. The unconditional baseline calibrates adverse
+selection and fill rate.
 
 The first prospective interval starts November 22 and ends at
 November 29, 2026 at 00:00 UTC, exclusive. A timestamp-only preflight
@@ -219,4 +240,17 @@ python -m copybot.microstructure_study /path/to/recorder-sqlite \
 
 When coverage is ready, replace `--check-only` with
 `--output /path/to/markouts.json`. This analysis leaves the recorded
-files unchanged.
+files unchanged. The volume file listing was verified against the mounted
+recorder. Download the closed SQLite parts for the study period before
+running the audit. The part for a UTC day closes after the recorder writes
+its first part for the next day.
+
+```sh
+railway volume --project 7cc71f2d-5c3a-4e79-916e-85e59e106503 \
+  --environment 8dbad813-f8d8-447f-8a86-2afd541bbdc3 files \
+  --volume 4b18442a-1043-4e40-a64f-49982f89dbe7 list / --json
+```
+
+Use the same project, environment, and volume arguments with
+`download /market-<part>.sqlite3 /path/to/recorder-sqlite/market-<part>.sqlite3`
+for each closed part covering the study interval.
