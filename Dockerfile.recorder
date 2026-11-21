@@ -4,4 +4,4 @@ ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
 COPY requirements-recorder.txt .
 RUN pip install --no-cache-dir -r requirements-recorder.txt
 COPY copybot/__init__.py copybot/recorder.py copybot/research_taxonomy.json ./copybot/
-CMD ["python", "-m", "copybot.recorder", "--output", "/data"]
+CMD ["python", "-m", "copybot.recorder", "--output", "/data", "--max-mib", "1536"]

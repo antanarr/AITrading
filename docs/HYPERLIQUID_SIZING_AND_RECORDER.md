@@ -81,10 +81,11 @@ atomic execution of live IOC baskets.
 
 ## Passive data collection
 
-The separate Railway recorder is running in Singapore with its own
-512 MB volume. The first heartbeat confirmed a committed context
-snapshot, 24 order books and 272 trades, with all subscriptions
-acknowledged. The trading worker stays paused.
+The separate Railway recorder is running in Singapore on a 2,048 MB
+volume. The first heartbeat after the storage upgrade confirmed a
+committed context snapshot, 24 order books and 272 trades, with all
+subscriptions acknowledged. The initial pilot volume was detached
+and preserved. The trading worker stays paused.
 [Recorder service](https://railway.com/project/7cc71f2d-5c3a-4e79-916e-85e59e106503/service/fb5f02e3-a461-4f47-966b-716839c3f7fc)
 
 The recorder connects to the public native perpetual market feed for
@@ -97,8 +98,8 @@ subscription counts and feed gaps. Trade records omit wallet addresses.
 
 The recorder compresses large book and market context payloads in SQLite.
 Use `copybot.recorder.decode_payload` to read JSON or compressed payloads.
-The recorder rotates files by UTC day or size and retains up to
-30 days subject to the 384 MiB archive limit. Oldest files age out first.
+The Railway recorder rotates files by UTC day or size and retains up
+to 30 days subject to the 1,536 MiB archive limit. Oldest files age out first.
 It runs with a single writer and its own data directory. A reconnect
 cannot recover every missed public event, so analysis must check the
 recorded gap markers. Sampling L2 every five seconds also limits
@@ -110,7 +111,7 @@ Start the public recorder on its dedicated volume:
 ```sh
 python -m pip install -r requirements-recorder.txt
 python -m copybot.recorder --output /data --top-n 8 --book-seconds 5 \
-  --max-mib 384 --retention-days 30
+  --max-mib 1536 --retention-days 30
 ```
 
 For local verification, use a disposable directory and add
@@ -128,3 +129,94 @@ python -m copybot.meme_study explore state/backruns/2026-11-21-meme \
 Repeat with `--initial-equity 47` and a different JSON output. Both artifacts
 include price P&L, costs, fills, risk thresholds and the complete
 per-variant and per-period rejection breakdown.
+
+## Follow-up with Gemini
+
+The clean factor test used daily and three-day clocks, no candle entry
+patterns, and three legs per side at inverse-volatility weights. Incumbents
+held on while ranked in the top or bottom six. Their sizes stayed in
+place unless the current target weight drifted by more than 25%. Trading
+costs applied only to nonzero deltas that passed the order minimum.
+
+The 72-hour funding rank was positive in both periods. The all-market
+version earned 331.25 and 221.36 USDC under stress. Removing the best
+coin's contribution left −74.96 and +27.66. The meme-only version earned
+80.69 and 156.32, falling to −50.58 and +5.82 after removing its
+respective largest contributor. Neither momentum nor short-term
+reversal had two profitable periods.
+
+```sh
+python -m copybot.factor_study state/backruns/2026-11-21-meme \
+  state/backruns/2026-11-20-sizing/factors.json \
+  --start 2026-05-25 --validation-start 2026-09-26 --end 2026-11-21
+```
+
+The portfolio was dollar-neutral at its target. Lot rounding, retained
+positions, and small-delta filters allow the actual net exposure to drift.
+Returns are stressed candle simulations. The evidence does not satisfy
+the existing Reserve qualification gate.
+
+### Funding-carry robustness
+
+Gemini challenged whether one profitable rebalance clock and two dominant
+coins explained the result. We ran 28 fixed robustness scenarios covering
+three start-day offsets, two through four legs per side, equal and
+inverse-volatility weights, and explicit re-ranking after removing SKR in
+Discovery or PONS in Validation. Each scenario still used the 72-hour
+clock, rank retention, the 25% drift rule and fees on deltas.
+
+| Stress net, USDC | Discovery offsets 0 / 1 / 2 | Validation offsets 0 / 1 / 2 |
+| --- | --- | --- |
+| All markets, 3 per side, inverse-volatility | +331.25 / −347.23 / −150.20 | +221.36 / +324.94 / +263.81 |
+| All markets, 3 per side, equal | +322.25 / −449.90 / −293.80 | +301.09 / +374.60 / +219.73 |
+| All markets, 4 per side, equal | +66.32 / −99.03 / −282.48 | +337.28 / +383.72 / +421.49 |
+| All markets, 3 per side, inverse-volatility, re-ranked without top contributor | −102.22 / −302.58 / −148.28 | +58.28 / +291.91 / +246.14 |
+| Meme-only, 3 per side, inverse-volatility | +80.69 / +49.32 / +61.44 | +156.32 / +114.80 / +99.73 |
+| Same meme-only runs, excluding best coin's contribution | −50.58 / −85.47 / −118.13 | +5.82 / −5.64 / −35.07 |
+
+The first all-market run's Discovery gross price plus funding contribution
+was +594.19 USDC on the long side and −190.52 on the short side, before
+execution costs. Validation reversed to −283.69 long and +540.72 short.
+Mean absolute imbalance after rebalancing was only 3–4% of gross exposure
+in Validation, but daily return correlations with the phase-open meme
+basket ranged from −0.58 to −0.45. Equal dollar exposure left substantial
+directional market sensitivity. The four-leg model with a 5% neutrality
+band still lost after removing its best coin in both periods.
+
+**No funding-carry configuration met the agreed clock, concentration and
+market-correlation checks.** Equal weights reduced the observed capital
+required to reproduce the 3-per-side Discovery sizing path to 82.86–155.36
+USDC across clocks, but the improved sizing did not restore robustness.
+The results favor the passive measurement next.
+
+Reproduce an individual robustness case with `--funding-72-only`,
+`--clock-offset-days 0|1|2`, `--legs-per-side 2|3|4`, and
+`--weighting equal|inverse-vol`. Use repeatable `--exclude-coin` flags
+to remove markets before ranking. The local `factor-robustness.json`
+includes base and stress returns, component P&L, Sharpe, drawdown, turnover,
+rebalance exposures, minimum equity and benchmark correlations.
+
+### Prospective maker measurement
+
+The passive audit uses 16-minute anchors to keep horizons from overlapping
+for each coin. Each quote rests for 60 seconds. It can only fill on a
+subsequent opposite-side trade strictly through the quoted price after a
+250 ms modeled activation delay. The primary metric is the executable
+five-minute round-trip markout at recorded quotes after entry and exit
+fees. Entry-to-mid markout, one- and 15-minute horizons, fill rates,
+and day and market breakdowns are recorded separately.
+
+The first prospective interval starts November 22 and ends at
+November 29, 2026 at 00:00 UTC, exclusive. A timestamp-only preflight
+checks for seven complete days. An evidence screen also requires at
+least 500 distinct eligible quote anchors. This window tests the
+passive-fill model and is separate from a frozen strategy's Reserve.
+
+```sh
+python -m copybot.microstructure_study /path/to/recorder-sqlite \
+  --start 2026-11-22 --end 2026-11-29 --check-only
+```
+
+When coverage is ready, replace `--check-only` with
+`--output /path/to/markouts.json`. This analysis leaves the recorded
+files unchanged.
