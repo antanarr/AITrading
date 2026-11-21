@@ -3,8 +3,10 @@ from dataclasses import replace
 
 import pytest
 
-from copybot.research_execution import BASE, STRESS, RiskLimits, replay
+from copybot.research_execution import BASE, STRESS, CostModel, RiskLimits, replay
 from copybot.research_models import HOUR_MS, Bar, Funding, MarketHistory, OrderPlan, TradePlan
+
+COSTLESS = CostModel("costless", 0, 0, 0, maker_fee_bps=0, taker_fee_bps=0)
 
 
 def bar(open_=100, high=100, low=100, close=100, *, volume=1_000):
@@ -38,6 +40,13 @@ def test_maker_requires_later_trade_through_and_expires_without_cost():
     assert result["count"] == 1
     assert result["trades"][0]["entered_ms"] == 3 * HOUR_MS - 1
 
+    immediate_expiry = run(market, order(ttl_hours=0))
+    assert immediate_expiry["maker_orders"] == 0
+    assert (
+        immediate_expiry["submission_diagnostics"]["replay"]["rejected"]["expired_on_submission"]
+        == 1
+    )
+
 
 @pytest.mark.parametrize("side, limit", [(1, 100.03), (-1, 99.97)])
 def test_post_only_rejects_order_at_opening_executable_quote(side, limit):
@@ -45,6 +54,9 @@ def test_post_only_rejects_order_at_opening_executable_quote(side, limit):
     result = run(market, order(side=side, limit=limit))
     assert result["count"] == 0
     assert result["maker_orders"] == 0
+    diagnostics = result["submission_diagnostics"]
+    assert diagnostics["replay"]["rejected"]["post_only_cross"] == 1
+    assert diagnostics["empty_book"]["1000"]["rejected"]["post_only_cross"] == 1
 
 
 def test_profit_limit_gets_maker_fee_and_requires_sequence_after_fill():
@@ -166,6 +178,37 @@ def test_ioc_uses_executable_limit_and_charges_only_funding_during_exposure():
     assert result["hours_in_market_pct"] == 25
 
 
+def test_four_leg_ioc_rejects_the_whole_plan_if_one_opening_quote_exceeds_its_cap():
+    markets = {
+        coin: history({0: bar(), 1: bar()}, coin) for coin in ("DOGE", "SPX", "PEPE", "PENGU")
+    }
+    plan = TradePlan(
+        (
+            order(limit=101, mode="ioc", weight=0.6),
+            order("SPX", 1, 101, mode="ioc", weight=0.4),
+            order("PEPE", -1, 99, mode="ioc", weight=0.6),
+            order("PENGU", -1, 99, mode="ioc", weight=0.4),
+        ),
+        "four-leg basket",
+    )
+    limits = RiskLimits(initial_equity=1_000)
+    matching = replay(markets, {0: [plan]}, 0, 2, limits=limits)
+    (trade,) = matching["trades"]
+    assert len(trade["legs"]) == 4
+    assert all(leg["entered_ms"] == 0 and leg["entry_mode"] == "ioc" for leg in trade["legs"])
+    net_notional = sum(leg["side"] * leg["entry"] * leg["size"] for leg in trade["legs"])
+    assert abs(net_notional) < 2.01  # Below the sum of two quantity lots on either side.
+    assert matching["fees"] > 0
+
+    opening_quarters = quarter_hour(0, [bar(98, 98, 98, 98)] * 4)
+    markets["PENGU"] = replace(markets["PENGU"], quarter_bars=opening_quarters)
+    missing_cap = replay(markets, {0: [plan]}, 0, 2, limits=limits)
+    assert missing_cap["count"] == missing_cap["fees"] == missing_cap["orphans"] == 0
+    diagnostics = missing_cap["submission_diagnostics"]
+    assert diagnostics["replay"]["rejected"]["entry_price_cap"] == 1
+    assert diagnostics["empty_book"]["1000"]["rejected"]["entry_price_cap"] == 1
+
+
 def test_trailing_stop_uses_completed_close():
     market = history(
         {0: bar(), 1: bar(high=103, low=99, close=103), 2: bar(103, 103, 101, 102), 3: bar()}
@@ -225,7 +268,102 @@ def test_risk_caps_and_exchange_minimum_apply_to_lot_rounded_size():
     assert result["count"] == 1
 
 
+def test_empty_book_threshold_uses_the_smallest_whole_lot_above_the_exchange_minimum():
+    market = history({0: bar(6.1, 6.1, 6.1, 6.1), 1: bar(6, 6, 5.5, 6)}, decimals=0)
+    plan = order(limit=6, stop_atr=1, target_atr=None)
+
+    below = run(market, plan, end=2, limits=RiskLimits(initial_equity=199.99), costs=COSTLESS)
+    at_minimum = run(market, plan, end=2, limits=RiskLimits(initial_equity=200), costs=COSTLESS)
+    assert below["count"] == 0
+    assert below["submission_diagnostics"]["replay"]["rejected"]["MIN_NOTIONAL"] == 1
+
+    diagnostics = at_minimum["submission_diagnostics"]
+    assert below["submission_diagnostics"]["empty_book"] == diagnostics["empty_book"]
+    assert diagnostics["empty_book"]["47"]["rejected"]["MIN_NOTIONAL"] == 1
+    assert diagnostics["empty_book"]["1000"]["accepted"] == 1
+    assert below["submission_diagnostics"]["executable_plans"] == diagnostics["executable_plans"]
+    (candidate,) = diagnostics["executable_plans"]
+    assert candidate == {
+        "hour": 0,
+        "candidate_number": 1,
+        "label": "one",
+        "coins": ["DOGE"],
+        "minimum_equity": {"1pct": 200, "2pct": 100},
+    }
+    (trade,) = at_minimum["trades"]
+    assert trade["legs"][0]["size"] == 2  # Two $6 lots are required to clear $10.
+    for scope in ("empty_book", "at_submission_occupancy"):
+        assert trade["sizing"][f"minimum_equity_{scope}"] == {"1pct": 200, "2pct": 100}
+    assert diagnostics["minimum_equity"]["filled_at_submission_occupancy"]["1pct"] == {
+        "count": 1,
+        "p50": 200,
+        "p90": 200,
+        "p95": 200,
+        "max": 200,
+    }
+    tighter_risk = run(
+        market,
+        plan,
+        end=2,
+        limits=RiskLimits(initial_equity=100, risk_fraction=0.02),
+        costs=COSTLESS,
+    )
+    assert tighter_risk["trades"][0]["legs"][0]["size"] == 2
+
+
+def test_weighted_basket_minimum_uses_the_gross_cap_after_each_leg_clears_the_floor():
+    markets = {
+        "DOGE": history({0: bar(10.1, 10.1, 10.1, 10.1), 1: bar(10, 10, 9.95, 10)}),
+        "SPX": history({0: bar(9.9, 9.9, 9.9, 9.9), 1: bar(10, 10.05, 10, 10)}, "SPX"),
+    }
+    plan = TradePlan(
+        (
+            order(limit=10, atr=0.1, stop_atr=1, target_atr=None, weight=0.75),
+            order("SPX", -1, 10, atr=0.1, stop_atr=1, target_atr=None, weight=0.25),
+        ),
+        "weighted",
+    )
+    limits = RiskLimits(initial_equity=200, max_gross_fraction=0.20)
+    result = replay(markets, {0: [plan]}, 0, 2, limits=limits, costs=COSTLESS)
+    (trade,) = result["trades"]
+    assert [leg["size"] for leg in trade["legs"]] == [3, 1]
+    assert trade["sizing"]["minimum_equity_empty_book"] == {"1pct": 200, "2pct": 200}
+
+
+@pytest.mark.parametrize(("slots", "rejection"), [(4, "budget"), (2, "slot_limit")])
+def test_submission_diagnostics_distinguish_occupied_budgets_and_slots(slots, rejection):
+    bars = {0: bar(50.1, 50.1, 50.1, 50.1), 1: bar(50, 50, 49.5, 50)}
+    markets = {coin: history(bars, coin, decimals=1) for coin in ("DOGE", "SPX", "PEPE")}
+    plans = [
+        TradePlan((order(coin, limit=50, stop_atr=1, target_atr=None),), coin) for coin in markets
+    ]
+    ideas = {0: [*plans, plans[0]], 2: plans}
+    limits = RiskLimits(
+        initial_equity=200, max_positions=slots, max_leg_fraction=0.20, max_net_fraction=0.30
+    )
+    result = replay(markets, ideas, 0, 2, costs=COSTLESS, limits=limits)
+    diagnostics = result["submission_diagnostics"]
+    actual = diagnostics["replay"]
+    assert actual["candidates"] == actual["accepted"] + sum(actual["rejected"].values()) == 4
+    assert actual["accepted"] == result["count"] == 2
+    assert actual["rejected"]["overlap"] == actual["rejected"][rejection] == 1
+    assert diagnostics["empty_book"]["1000"]["accepted"] == 4
+    assert diagnostics["empty_book"]["47"]["rejected"]["MIN_NOTIONAL"] == 4
+
+    first, second = result["trades"]
+    assert first["sizing"]["reserved_positions"] == 0
+    assert second["sizing"]["reserved_positions"] == 1
+    assert second["sizing"]["reserved_long_notional"] == 40
+    assert second["sizing"]["reserved_short_notional"] == 0
+    assert second["sizing"]["minimum_equity_empty_book"] == {"1pct": 50, "2pct": 50}
+    assert second["sizing"]["minimum_equity_at_submission_occupancy"] == pytest.approx(
+        {"1pct": (40 + 10) / 0.30, "2pct": (40 + 10) / 0.30}
+    )
+
+
 def test_data_gaps_cancel_unfilled_orders_and_raise_for_unpriced_exposure():
+    missing_opening = run(history({1: bar()}), end=2)
+    assert missing_opening["submission_diagnostics"]["replay"]["rejected"]["data_gap"] == 1
     result = run(history({0: bar(), 2: bar(low=99), 3: bar()}))
     assert result["count"] == result["fees"] == 0
     assert result["pending_data_gaps"] == 1

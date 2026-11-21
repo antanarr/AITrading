@@ -3,6 +3,9 @@
 Mainnet entries are paused. The research commands read market archives and
 write JSON. They have no wallet, signing path, or SQLite journal access.
 
+The [sizing audit and recorder follow-up](HYPERLIQUID_SIZING_AND_RECORDER.md)
+replays the same periods at both 47 and 1,000 USDC and adds nine controls.
+
 ## Validation result
 
 **No candidate qualified in Validation.** Zero rules were frozen. The new

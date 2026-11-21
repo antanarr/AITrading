@@ -40,6 +40,15 @@ def test_momentum_can_qualify_with_fewer_winners_if_payoffs_cover_losses():
     assert meme_study.qualification("B", score(count=20, wins=8, win_rate=0.40))["pass"]
 
 
+def test_shortlist_requires_positive_stress_net_in_both_periods():
+    variant = {"name": "test", "family": "funding"}
+    validation = [{"variant": variant, "stress": score(), "qualification": {"pass": True}}]
+    assert not meme_study.shortlist([{"variant": variant, "stress": score(net=-0.1)}], validation)
+    assert meme_study.shortlist([{"variant": variant, "stress": score(net=0.1)}], validation) == [
+        variant
+    ]
+
+
 def test_combined_exclusion_does_not_subtract_best_trade_coin_twice():
     metrics = {
         "trades": [

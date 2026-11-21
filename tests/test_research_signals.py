@@ -1,5 +1,7 @@
 from dataclasses import replace
 
+import pytest
+
 from copybot.research_models import HOUR_MS, Bar, Funding, MarketHistory
 from copybot.research_signals import PriceRange, SignalFrame, build_frames, ideas, variants
 
@@ -88,6 +90,73 @@ def test_eligibility_excludes_btc_sparse_hours_and_unverified_young_listings():
     assert frames[decision]["VERIFIED"].turnover == 1_200_000
 
 
+def _trend_history(
+    coin: str, first: int, end: int, change: float, *, is_meme: bool = True, listing=None
+) -> MarketHistory:
+    bars = {hour: _bar(100 * (1 + change) ** (hour - first)) for hour in range(first, end)}
+    return MarketHistory(coin, 2, is_meme, listing, bars, {})
+
+
+def test_basket_compounds_prior_rosters_and_is_warmed_at_the_partition_start():
+    decision = 300
+    members = [_trend_history(f"MEME_{index}", 0, decision, index / 1000) for index in range(1, 6)]
+    outgoing = members[-1]
+    members[-1] = replace(
+        outgoing,
+        bars={**outgoing.bars, decision - 1: replace(outgoing.bars[decision - 1], volume=0)},
+    )
+    excluded = [
+        _trend_history("PERP:BTC", 0, decision, 0.012),
+        _trend_history("NON_MEME", 0, decision, 0.012, is_meme=False),
+    ]
+    newcomer = _trend_history("NEW", decision - 24, decision, 0.02, listing=decision - 24)
+    young = _trend_history("YOUNG", decision - 13, decision, 0.02, listing=decision - 13)
+    histories = {history.coin: history for history in (*members, *excluded, newcomer, young)}
+    frames = build_frames(histories, decision, decision + 1)
+    assert set(frames) == {decision}
+    assert "NEW" in frames[decision] and outgoing.coin not in frames[decision]
+    expected = {window: 1.003**window - 1 for window in (72, 168)}
+    for frame in frames[decision].values():
+        assert frame.basket_trends == pytest.approx(expected)
+
+    changed = {
+        coin: replace(history, bars={**history.bars, decision: _bar(4000)})
+        for coin, history in histories.items()
+    }
+    extended = build_frames(changed, decision - 10, decision + 2)
+    assert young.coin in extended[decision - 1]
+    assert extended[decision] == frames[decision]
+
+    execution_histories = {members[0].coin: members[0]}
+    assert (
+        build_frames(execution_histories, decision, decision + 1)[decision][
+            members[0].coin
+        ].basket_trends
+        == {}
+    )
+    execution_frames = build_frames(
+        execution_histories, decision, decision + 1, basket_histories=histories
+    )
+    assert execution_frames[decision] == {members[0].coin: frames[decision][members[0].coin]}
+
+
+def test_basket_missing_price_cuts_the_chain_at_its_decision():
+    decision = 300
+    histories = {
+        f"MEME_{index}": _trend_history(f"MEME_{index}", 0, decision, 0.001) for index in range(6)
+    }
+    history = histories["MEME_5"]
+    cut = decision - 100
+    histories[history.coin] = replace(
+        history, bars={hour: bar for hour, bar in history.bars.items() if hour != cut}
+    )
+    frames = build_frames(histories, cut, decision + 1)
+    coin = "MEME_0"
+    assert set(frames[cut][coin].basket_trends) == {72, 168}
+    assert frames[cut + 1][coin].basket_trends == {}
+    assert frames[decision][coin].basket_trends == pytest.approx({72: 1.001**72 - 1})
+
+
 def test_funding_exhaustion_fades_the_bounce_and_squeeze_reclaims_a_higher_low():
     short = _frame()
     assert _ideas("funding-6h", short)[0].legs[0].side == -1
@@ -151,6 +220,39 @@ def test_dispersion_fades_outlier_into_vwap_with_exhaustion_and_funding():
     assert _ideas("dispersion-4h", *ordinary[1:], outlier) == []
 
 
+@pytest.mark.parametrize("family", ("funding-6h", "dispersion-4h"))
+@pytest.mark.parametrize("side", (-1, 1))
+def test_basket_trend_requires_both_windows_to_align_with_the_trade(family, side):
+    ordinary = [_frame(f"MEME_{index}") for index in range(4)]
+    if side == 1:
+        outlier = _frame(
+            bar=Bar(99.8, 102, 98.2, 101.7, 450),
+            previous=Bar(101.1, 101.2, 98.0, 100.0, 250),
+            vwap12=102.4,
+            funding_bps=(-0.65,) * 6,
+            returns={4: -0.03},
+        )
+        if family == "funding-6h":
+            outlier = replace(outlier, vwap12=100.5)
+            ordinary = []
+    else:
+        outlier = _frame(returns={4: 0.029})
+        if family == "funding-6h":
+            ordinary = []
+
+    control = _ideas(family, *ordinary, outlier)[0].legs[0]
+    assert control.side == side
+    gated = f"{family}-basket-trend"
+    aligned = replace(outlier, basket_trends={72: side * 0.05, 168: side * 0.10})
+    assert _ideas(gated, *ordinary, aligned)[0].legs[0] == control
+    for basket_trends in (
+        {72: side * 0.05},
+        {72: side * 0.05, 168: -side * 0.10},
+        {72: 0, 168: side * 0.10},
+    ):
+        assert _ideas(gated, *ordinary, replace(outlier, basket_trends=basket_trends)) == []
+
+
 def test_pair_uses_equal_plan_weights_and_clock_or_dispersion_trigger():
     scores = (-0.2, -0.02, 0, 0.02, 0.2)
     basket = [_frame(f"MEME_{i}", returns={24: score, 48: score}) for i, score in enumerate(scores)]
@@ -167,6 +269,41 @@ def test_pair_uses_equal_plan_weights_and_clock_or_dispersion_trigger():
     assert ideas(frames, MENU["pair-dispersion"]) == {120: [replace(pair, label="pair-dispersion")]}
 
 
+@pytest.mark.parametrize("direction,label", ((1, "momentum"), (-1, "reversion")))
+def test_ioc_pairs_use_window_ranks_and_price_capped_equal_weight_legs(direction, label):
+    scores = (-0.4, -0.24, 0, 0.24, 0.4)
+    basket = [
+        _frame(f"MEME_{i}", returns={24: -score, 72: score}) for i, score in enumerate(scores)
+    ]
+    market = {frame.coin: frame for frame in basket}
+    clock = f"pair-clock-ioc-{label}"
+    assert _ideas(clock, *basket, hour=121) == []
+    clock_plan = _ideas(clock, *basket)[0]
+    assert [(leg.coin, leg.side) for leg in clock_plan.legs] == [
+        ("MEME_0", direction),
+        ("MEME_4", -direction),
+    ]
+
+    # The extreme scores alone clear the threshold here. A two-by-two spread does not.
+    marginal = {
+        frame.coin: replace(frame, returns={72: score})
+        for frame, score in zip(basket, (-0.15, 0, 0, 0, 0.15), strict=True)
+    }
+    frames = {118: marginal, 119: marginal, 120: market, 121: market}
+    dispersion = ideas(frames, MENU[f"pair-dispersion-ioc-{label}"])
+    assert set(dispersion) == {120}
+    assert [(leg.coin, leg.side) for leg in dispersion[120][0].legs] == [
+        ("MEME_4", direction),
+        ("MEME_3", direction),
+        ("MEME_0", -direction),
+        ("MEME_1", -direction),
+    ]
+    for leg in (*clock_plan.legs, *dispersion[120][0].legs):
+        assert leg.mode == "ioc" and leg.ttl_hours == 0 and leg.weight == 1
+        quote = market[leg.coin].bar.close
+        assert leg.limit == pytest.approx(quote * (1 + leg.side * 0.001))
+
+
 def test_compression_breakout_retests_bound_and_applies_variant_exit_settings():
     decision = 400
     bars = {hour: _bar(100 if hour % 2 else 101, width=2) for hour in range(100, 375)}
@@ -180,6 +317,9 @@ def test_compression_breakout_retests_bound_and_applies_variant_exit_settings():
     assert order.target_atr is None and order.trailing_atr == 2.0 and order.ttl_hours == 2
     taker = ideas(frames, MENU["compression-12h-taker"])[decision][0].legs[0]
     assert taker == replace(order, mode="ioc", limit=102.6 * 1.0015, ttl_hours=0)
+    for ratio in (1.5, 2.5):
+        fixed = ideas(frames, MENU[f"compression-12h-maker-{ratio}r"])[decision][0].legs[0]
+        assert fixed == replace(order, target_atr=order.stop_atr * ratio, trailing_atr=None)
 
     retest = replace(
         variant,
@@ -198,6 +338,8 @@ def test_regime_breadth_and_volatility_gate_maker_leadership_pullback():
     order = _ideas("regime-24h", *ordinary, leader)[0].legs[0]
     assert order.coin == leader.coin and order.side == 1
     assert order.limit == leader.vwap12 < leader.bar.close
+    fixed = _ideas("regime-24h-maker-2.5r", *ordinary, leader)[0].legs[0]
+    assert fixed == replace(order, target_atr=order.stop_atr * 2.5)
     volatile = [replace(frame, vol_ratio=2.0) for frame in (*ordinary, leader)]
     assert _ideas("regime-24h", *volatile) == []
     mixed = [replace(frame, returns={24: -0.04}) for frame in ordinary[:2]]

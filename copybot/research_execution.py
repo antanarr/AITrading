@@ -1,8 +1,10 @@
 """Replay research orders using archived public candles and funding settlements."""
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
+from fractions import Fraction
+from math import ceil
 from statistics import mean
 
 from .perps import round_price
@@ -10,7 +12,21 @@ from .research_models import HOUR_MS, MarketHistory, OrderPlan, TradePlan, exclu
 
 QUARTER_MS = HOUR_MS // 4
 PER_BPS = 10_000
-MIN_NOTIONAL = Decimal(10)
+MIN_NOTIONAL = 10
+COMPARISON_EQUITIES = (47, 1_000)
+RISK_LEVELS = {"1pct": Fraction(1, 100), "2pct": Fraction(2, 100)}
+REJECTIONS = (
+    "MIN_NOTIONAL",
+    "budget",
+    "slot_limit",
+    "overlap",
+    "post_only_cross",
+    "entry_price_cap",
+    "invalid_price",
+    "data_gap",
+    "zero_volume",
+    "expired_on_submission",
+)
 
 
 @dataclass(frozen=True)
@@ -65,7 +81,7 @@ class _Leg:
 
     @property
     def notional(self):
-        return self.size * self.entry
+        return _number(self.size) * _number(self.entry)
 
     def fill(self, stamp, slice_start):
         self.entered_ms = stamp
@@ -78,6 +94,7 @@ class _Bet:
     legs: list[_Leg]
     submitted_hour: int
     expires_after: int
+    sizing: dict
     exit_next: str | None = None
     orphan: bool = False
 
@@ -90,6 +107,10 @@ class _Bet:
 
 def _price(price, decimals, rounding):
     return float(round_price(Decimal(str(price)), decimals, rounding))
+
+
+def _number(value):
+    return Fraction(str(value))
 
 
 def _before_stop(side, price, stop):
@@ -112,12 +133,12 @@ def _prepared_leg(plan, history, bar, costs):
         raise ValueError(f"Invalid order duration or weight for {plan.coin}")
     limit = _price(plan.limit, history.decimals, ROUND_DOWN if side > 0 else ROUND_CEILING)
     if limit <= 0:
-        return None
+        return "invalid_price"
     if plan.mode == "maker":
         offset = Decimal(side) * Decimal(str(costs.half_spread_bps)) / PER_BPS
         executable = Decimal(str(bar.open)) * (1 + offset)
         if not _through_limit(side, Decimal(str(limit)), executable):
-            return None
+            return "post_only_cross"
         entry = reference = limit
         fee_bps = costs.maker_fee_bps
     elif plan.mode in ("ioc", "taker"):
@@ -125,7 +146,7 @@ def _prepared_leg(plan, history, bar, costs):
         bps = Decimal(str(costs.half_spread_bps)) + Decimal(str(costs.entry_impact_bps))
         executable = Decimal(str(reference)) * (1 + side * bps / PER_BPS)
         if (executable - Decimal(str(limit))) * side > 0:
-            return None
+            return "entry_price_cap"
         entry = float(executable)
         fee_bps = costs.taker_fee_bps
     else:
@@ -143,9 +164,9 @@ def _prepared_leg(plan, history, bar, costs):
     if target is not None:
         target = _price(target, history.decimals, rounding)
     if stop <= 0 or (entry - stop) * side <= 0:
-        return None
+        return "invalid_price"
     if target is not None and (target <= 0 or (target - entry) * side <= 0):
-        return None
+        return "invalid_price"
     return _Leg(
         plan,
         history,
@@ -161,45 +182,95 @@ def _prepared_leg(plan, history, bar, costs):
     )
 
 
-def _size_legs(legs, reserved, capital, costs, limits):
-    if capital <= 0 or len(reserved) + len(legs) > limits.max_positions:
-        return False
-    gross_available = capital * limits.max_gross_fraction - sum(leg.notional for leg in reserved)
-    # A partially filled basket can be directional, so reserve both sides independently.
-    net_available = {
-        side: capital * limits.max_net_fraction
-        - sum(leg.notional for leg in reserved if leg.plan.side == side)
-        for side in (1, -1)
-    }
-    weight = sum(leg.plan.weight for leg in legs)
-    caps = [gross_available / weight]
-    for side, available in net_available.items():
-        side_weight = sum(leg.plan.weight for leg in legs if leg.plan.side == side)
-        if side_weight:
-            caps.append(available / side_weight)
-    for leg in legs:
-        stop_fill = _market_exit(leg.stop, -leg.plan.side, costs)
-        risk = (leg.entry - stop_fill) * leg.plan.side + leg.entry_fee
-        risk += stop_fill * costs.taker_fee_bps / PER_BPS
-        caps.append(
-            min(
-                capital * limits.max_leg_fraction, capital * limits.risk_fraction * leg.entry / risk
-            )
-            / leg.plan.weight
+class _Sizing:
+    def __init__(self, legs, costs, limits):
+        self.legs = legs
+        self.weights = [_number(leg.plan.weight) for leg in legs]
+        self.lots = [Fraction(1, 10**leg.history.decimals) for leg in legs]
+        prices = [_number(leg.entry) for leg in legs]
+        self.lot_values = [lot * price for lot, price in zip(self.lots, prices, strict=True)]
+        # A whole lot at the actual modeled entry must clear the exchange minimum.
+        self.minimum_unit = max(
+            ceil(MIN_NOTIONAL / value) * value / weight
+            for value, weight in zip(self.lot_values, self.weights, strict=True)
         )
+        impact = (_number(costs.half_spread_bps) + _number(costs.exit_impact_bps)) / PER_BPS
+        taker_fee = _number(costs.taker_fee_bps) / PER_BPS
+        entry_fee = (
+            _number(costs.maker_fee_bps) / PER_BPS if legs[0].plan.mode == "maker" else taker_fee
+        )
+        stop_risks = []
+        for leg, price, weight in zip(legs, prices, self.weights, strict=True):
+            side = leg.plan.side
+            stop_fill = _number(leg.stop) * (1 - side * impact)
+            stop_loss = (price - stop_fill) * side + price * entry_fee + stop_fill * taker_fee
+            stop_risks.append(weight * stop_loss / price)
+        self.stop_risk_per_unit = max(stop_risks)
+        self.gross_fraction = _number(limits.max_gross_fraction)
+        self.net_fraction = _number(limits.max_net_fraction)
+        self.leg_fraction = _number(limits.max_leg_fraction)
+        self.side_weights = {
+            side: sum(
+                weight
+                for leg, weight in zip(legs, self.weights, strict=True)
+                if leg.plan.side == side
+            )
+            for side in (1, -1)
+        }
 
-    unit = min(caps)
-    if unit <= 0:
-        return False
-    for leg in legs:
-        price = Decimal(str(leg.entry))
-        lot = Decimal(1).scaleb(-leg.history.decimals)
-        size = (Decimal(str(unit * leg.plan.weight)) / price).quantize(lot, rounding=ROUND_DOWN)
-        if size * price < MIN_NOTIONAL:
-            return False
-        leg.size = float(size)
-        leg.entry_fee *= leg.size
-    return True
+    def constraints(self, amounts):
+        # Each bound is (equity fraction, reserved amount, weight) for the shared basket quantity.
+        yield self.gross_fraction, sum(amounts.values()), sum(self.weights)
+        # Until every leg fills, directional exposure can reach either side's full notional.
+        for side, weight in self.side_weights.items():
+            if weight:
+                yield self.net_fraction, amounts[side], weight
+        yield self.leg_fraction, 0, max(self.weights)
+
+    def maximum_unit(self, capital, amounts, risk_fraction):
+        limits = [
+            (capital * fraction - occupied) / weight
+            for fraction, occupied, weight in self.constraints(amounts)
+        ]
+        limits.append(capital * risk_fraction / self.stop_risk_per_unit)
+        return min(limits)
+
+    def minimum_equities(self, amounts):
+        constraints = list(self.constraints(amounts))
+        if any(fraction <= 0 for fraction, _, _ in constraints):
+            return {}
+        portfolio_minimum = max(
+            (self.minimum_unit * weight + occupied) / fraction
+            for fraction, occupied, weight in constraints
+        )
+        stop_risk = self.minimum_unit * self.stop_risk_per_unit
+        return {
+            label: max(portfolio_minimum, stop_risk / fraction)
+            for label, fraction in RISK_LEVELS.items()
+        }
+
+    def assign(self, unit):
+        for leg, weight, lot, value in zip(
+            self.legs, self.weights, self.lots, self.lot_values, strict=True
+        ):
+            leg.size = float(lot * (unit * weight // value))
+            leg.entry_fee *= leg.size
+
+    def outcome(self, maximum_unit):
+        if maximum_unit <= 0:
+            return "budget"
+        return "MIN_NOTIONAL" if maximum_unit < self.minimum_unit else "accepted"
+
+
+def _reserved_notional(reserved):
+    amounts = dict.fromkeys((1, -1), Fraction(0))
+    for leg in reserved:
+        amounts[leg.plan.side] += leg.notional
+    return amounts
+
+
+def _capital_record(thresholds):
+    return {key: float(value) for key, value in thresholds.items()}
 
 
 def _funding(leg, stamp):
@@ -246,8 +317,42 @@ class _Replay:
         self.pending_data_gaps = 0
         self.zero_volume_submissions = self.deferred_exit_slices = self.terminal_proxy_exits = 0
         self.marks = {}
+        self.submissions = Counter()
+        self.empty_book_submissions = {equity: Counter() for equity in COMPARISON_EQUITIES}
+        self.executable_plans = []
+        self.risk_fraction = _number(limits.risk_fraction)
+        self.initial_equity = _number(limits.initial_equity)
 
-    def submit(self, plan, hour):
+    def prepare(self, plan, hour):
+        legs = []
+        for order in plan.legs:
+            history = self.histories[order.coin]
+            bar = history.bars.get(hour)
+            if bar is None:
+                return "data_gap"
+            opening = history.quarter_bars.get(hour * HOUR_MS, bar)
+            if bar.volume <= 0 or opening.volume <= 0:
+                return "zero_volume"
+            leg = _prepared_leg(order, history, opening, self.costs)
+            if isinstance(leg, str):
+                return leg
+            legs.append(leg)
+        if legs[0].plan.mode == "maker" and any(leg.plan.ttl_hours == 0 for leg in legs):
+            return "expired_on_submission"
+        return legs
+
+    def inspect_empty_book(self, sizing, rejection, amounts):
+        if rejection:
+            for outcomes in self.empty_book_submissions.values():
+                outcomes[rejection] += 1
+            return {}
+        minimums = sizing.minimum_equities(amounts)
+        for equity, outcomes in self.empty_book_submissions.items():
+            unit = sizing.maximum_unit(Fraction(equity), amounts, self.risk_fraction)
+            outcomes[sizing.outcome(unit)] += 1
+        return minimums
+
+    def submit(self, plan, hour, candidate_number):
         coins = {leg.coin for leg in plan.legs}
         if not coins or len(coins) != len(plan.legs):
             raise ValueError("Research bet requires one or more distinct markets")
@@ -255,34 +360,69 @@ class _Replay:
             raise ValueError("BTC and BTC aliases are excluded from this research")
         if len({leg.mode for leg in plan.legs}) != 1:
             raise ValueError("All legs of a research bet must use the same order mode")
+
+        legs = self.prepare(plan, hour)
+        rejection = legs if isinstance(legs, str) else None
+        if len(coins) > self.limits.max_positions and rejection is None:
+            rejection = "slot_limit"
+        sizing = None if rejection else _Sizing(legs, self.costs, self.limits)
+        empty_book = _reserved_notional(())
+        empty_book_minimums = self.inspect_empty_book(sizing, rejection, empty_book)
+        if empty_book_minimums:
+            self.executable_plans.append(
+                {
+                    "hour": hour,
+                    "candidate_number": candidate_number,
+                    "label": plan.label,
+                    "coins": [leg.coin for leg in plan.legs],
+                    "minimum_equity": _capital_record(empty_book_minimums),
+                }
+            )
+
         reserved = [leg for bet in self.bets for leg in bet.legs if leg.pending or leg.open]
         if coins.intersection(leg.plan.coin for leg in reserved):
+            self.submissions["overlap"] += 1
             return
-        legs = []
-        for order in plan.legs:
-            history = self.histories[order.coin]
-            bar = history.bars.get(hour)
-            if bar is None:
-                return
-            opening = history.quarter_bars.get(hour * HOUR_MS, bar)
-            if bar.volume <= 0 or opening.volume <= 0:
-                self.zero_volume_submissions += 1
-                return
-            leg = _prepared_leg(order, history, bar, self.costs)
-            if leg is None:
-                return
-            legs.append(leg)
-        if not _size_legs(
-            legs, reserved, self.limits.initial_equity + self.closed_equity, self.costs, self.limits
-        ):
+        if rejection:
+            self.zero_volume_submissions += rejection == "zero_volume"
+            self.submissions[rejection] += 1
             return
+        if len(reserved) + len(legs) > self.limits.max_positions:
+            self.submissions["slot_limit"] += 1
+            return
+
+        equity = self.initial_equity + _number(self.closed_equity)
+        amounts = _reserved_notional(reserved) if reserved else empty_book
+        unit = sizing.maximum_unit(equity, amounts, self.risk_fraction)
+        outcome = sizing.outcome(unit) if equity > 0 else "budget"
+        self.submissions[outcome] += 1
+        if outcome != "accepted":
+            return
+
+        sizing.assign(unit)
+        occupancy_minimums = sizing.minimum_equities(amounts) if reserved else empty_book_minimums
         expiry = hour + min(leg.plan.ttl_hours for leg in legs)
-        bet = _Bet(plan, legs, hour, expiry)
+        bet = _Bet(
+            plan,
+            legs,
+            hour,
+            expiry,
+            {
+                "submitted_hour": hour,
+                "candidate_number": candidate_number,
+                "equity_at_submission": float(equity),
+                "reserved_positions": len(reserved),
+                "reserved_long_notional": float(amounts[1]),
+                "reserved_short_notional": float(amounts[-1]),
+                "minimum_equity_empty_book": _capital_record(empty_book_minimums),
+                "minimum_equity_at_submission_occupancy": _capital_record(occupancy_minimums),
+            },
+        )
         if legs[0].plan.mode == "maker":
             self.maker_orders += len(legs)
-            if expiry == hour:
-                return
         else:
+            # All price caps pass the opening proxy before this modeled IOC basket enters.
+            # Candles cannot resolve liquidity, queue position, or multi-order coordination.
             for leg in legs:
                 leg.fill(hour * HOUR_MS, hour * HOUR_MS)
         self.bets.append(bet)
@@ -481,6 +621,7 @@ class _Replay:
             {
                 "label": bet.plan.label,
                 "legs": legs,
+                "sizing": bet.sizing,
                 "orphan": bet.orphan,
                 "entered_ms": min(leg["entered_ms"] for leg in legs),
                 "exited_ms": max(leg["exited_ms"] for leg in legs),
@@ -491,8 +632,8 @@ class _Replay:
     def hour(self, plans, hour, end):
         self.marks.clear()
         before = self.net
-        for plan in plans:
-            self.submit(plan, hour)
+        for candidate_number, plan in enumerate(plans, start=1):
+            self.submit(plan, hour, candidate_number)
         active = []
         for bet in self.bets:
             self.run_bet(bet, hour, last=hour == end - 1)
@@ -519,6 +660,29 @@ class _Replay:
 
 
 _PNL_KEYS = ("gross", "funding", "fees", "slippage", "net")
+
+
+def _submission_counts(outcomes):
+    return {
+        "candidates": sum(outcomes.values()),
+        "accepted": outcomes["accepted"],
+        "rejected": {reason: outcomes[reason] for reason in REJECTIONS},
+    }
+
+
+def _capital_summary(thresholds):
+    summary = {}
+    for risk in RISK_LEVELS:
+        values = sorted(float(plan[risk]) for plan in thresholds if risk in plan)
+        count = len(values)
+        summary[risk] = {
+            "count": count,
+            **{
+                name: values[(rank * count + 99) // 100 - 1] if count else None
+                for name, rank in (("p50", 50), ("p90", 90), ("p95", 95), ("max", 100))
+            },
+        }
+    return summary
 
 
 def _summarize(engine, hours):
@@ -562,6 +726,28 @@ def _summarize(engine, hours):
         "terminal_proxy_exits": engine.terminal_proxy_exits,
         "hours_in_market_pct": 100 * len(exposed_hours) / hours if hours else 0,
         "orphans": sum(trade["orphan"] for trade in trades),
+        "submission_diagnostics": {
+            "initial_equity": engine.limits.initial_equity,
+            "risk_fraction_per_leg": engine.limits.risk_fraction,
+            "minimum_notional_per_leg": MIN_NOTIONAL,
+            "replay": _submission_counts(engine.submissions),
+            "empty_book": {
+                str(equity): _submission_counts(outcomes)
+                for equity, outcomes in engine.empty_book_submissions.items()
+            },
+            "executable_plans": engine.executable_plans,
+            "minimum_equity": {
+                "executable_empty_book": _capital_summary(
+                    [plan["minimum_equity"] for plan in engine.executable_plans]
+                ),
+                "filled_empty_book": _capital_summary(
+                    [trade["sizing"]["minimum_equity_empty_book"] for trade in trades]
+                ),
+                "filled_at_submission_occupancy": _capital_summary(
+                    [trade["sizing"]["minimum_equity_at_submission_occupancy"] for trade in trades]
+                ),
+            },
+        },
         "by_coin": dict(sorted(by_coin.items())),
         "trades": trades,
     }

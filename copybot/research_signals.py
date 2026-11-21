@@ -1,11 +1,11 @@
 """Point-in-time signals for offline Hyperliquid research."""
 
 from bisect import bisect_left, bisect_right, insort
-from collections import deque
+from collections import defaultdict, deque
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from itertools import pairwise
-from math import log, sqrt
+from math import expm1, fsum, log, log1p, sqrt
 from statistics import fmean, median
 
 from .research_models import HOUR_MS, Bar, MarketHistory, OrderPlan, TradePlan, excluded_symbol
@@ -14,6 +14,7 @@ LISTING_MIN_HOURS = 12
 LISTING_MAX_HOURS = 14 * 24
 COMPRESSION_HISTORY_HOURS = 7 * 24
 RETURN_WINDOWS = (4, 12, 24, 48, 72)
+BASKET_TREND_WINDOWS = (72, 168)
 MINIMUM_BASKET_SIZE = 5
 IOC_LIMIT_BPS = 15
 RankedOrder = tuple[float, OrderPlan]
@@ -52,6 +53,76 @@ def variants() -> tuple[Variant, ...]:
         ),
         Variant("regime-24h", "regime", "B", (("window", 24), ("breadth", 0.65))),
         Variant("regime-72h", "regime", "B", (("window", 72), ("breadth", 0.70))),
+        Variant(
+            "funding-6h-basket-trend",
+            "funding",
+            "A",
+            (("funding_bps", 0.35), ("high_count", 4), ("basket_trend", 1)),
+        ),
+        Variant(
+            "dispersion-4h-basket-trend",
+            "dispersion",
+            "A",
+            (("window", 4), ("multiple", 2.25), ("basket_trend", 1)),
+        ),
+        Variant(
+            "compression-12h-maker-1.5r",
+            "compression",
+            "B",
+            (("window", 12), ("percentile", 0.20), ("target_r", 1.5)),
+        ),
+        Variant(
+            "compression-12h-maker-2.5r",
+            "compression",
+            "B",
+            (("window", 12), ("percentile", 0.20), ("target_r", 2.5)),
+        ),
+        Variant(
+            "regime-24h-maker-2.5r",
+            "regime",
+            "B",
+            (("window", 24), ("breadth", 0.65), ("target_r", 2.5)),
+        ),
+        Variant(
+            "pair-clock-ioc-momentum",
+            "pair",
+            "A",
+            (("window", 24), ("multiple", 2.5), ("interval", 12), ("ioc_limit_bps", 10)),
+            "ioc",
+        ),
+        Variant(
+            "pair-clock-ioc-reversion",
+            "pair",
+            "A",
+            (
+                ("window", 24),
+                ("multiple", 2.5),
+                ("interval", 12),
+                ("ioc_limit_bps", 10),
+                ("direction", -1),
+            ),
+            "ioc",
+        ),
+        Variant(
+            "pair-dispersion-ioc-momentum",
+            "pair",
+            "A",
+            (("window", 72), ("multiple", 3.5), ("legs_per_side", 2), ("ioc_limit_bps", 10)),
+            "ioc",
+        ),
+        Variant(
+            "pair-dispersion-ioc-reversion",
+            "pair",
+            "A",
+            (
+                ("window", 72),
+                ("multiple", 3.5),
+                ("legs_per_side", 2),
+                ("ioc_limit_bps", 10),
+                ("direction", -1),
+            ),
+            "ioc",
+        ),
     )
 
 
@@ -82,6 +153,7 @@ class SignalFrame:
     funding_bps: tuple[float, ...]
     compression_percentiles: Mapping[int, float]
     listing_peak: float | None
+    basket_trends: Mapping[int, float] = field(default_factory=dict)
 
 
 class _CompressionHistory:
@@ -138,6 +210,41 @@ def _recent_funding(funding: Mapping[int, float | None], hour: int) -> tuple[flo
     return tuple(rates)
 
 
+def _basket_trends(
+    members: Mapping[int, list[MarketHistory]], start: int, end: int
+) -> dict[int, dict[int, float]]:
+    longest = max(BASKET_TREND_WINDOWS)
+    links: deque[float] = deque(maxlen=longest)
+    trends = {}
+    for hour in range(start - longest + 1, end):
+        roster = members.get(hour - 1, ())
+        if len(roster) < MINIMUM_BASKET_SIZE:
+            links.clear()
+            continue
+
+        # Hold the prior decision's roster through this link, even for an asset
+        # that loses eligibility at the current close. A missing price cuts the chain.
+        changes = []
+        for history in roster:
+            closed = history.bars.get(hour - 1)
+            if closed is None:
+                break
+            previous = history.bars[hour - 2].close
+            changes.append((closed.close - previous) / previous)
+        else:
+            links.append(log1p(fmean(changes)))
+            if hour >= start and len(links) >= min(BASKET_TREND_WINDOWS):
+                recent = list(links)
+                trends[hour] = {
+                    window: expm1(fsum(recent[-window:]))
+                    for window in BASKET_TREND_WINDOWS
+                    if len(links) >= window
+                }
+            continue
+        links.clear()
+    return trends
+
+
 def build_frames(
     histories: Mapping[str, MarketHistory],
     start_hour: int,
@@ -145,17 +252,29 @@ def build_frames(
     *,
     minimum_turnover: float = 250_000,
     minimum_active_hours: int = 9,
+    basket_histories: Mapping[str, MarketHistory] | None = None,
 ) -> dict[int, dict[str, SignalFrame]]:
     """Prepare eligible markets at UTC hour boundaries, with an exclusive end hour.
 
     Candle keys represent opens. Decisions at hour H observe candles and funding
     from hours strictly before H. Warmup builds features without emitting ideas.
+    Basket prices may include markets that were excluded from execution for data quality.
     """
     frames: dict[int, dict[str, SignalFrame]] = {}
     warmup = max(LISTING_MAX_HOURS, COMPRESSION_HISTORY_HOURS + max(RETURN_WINDOWS))
-    for history in sorted(histories.values(), key=lambda item: item.coin):
+    trading_coins = {history.coin: history for history in histories.values()}
+    basket_coins = {
+        history.coin: history
+        for history in (histories if basket_histories is None else basket_histories).values()
+        if history.is_meme and not excluded_symbol(history.coin)
+    }
+    basket_members: dict[int, list[MarketHistory]] = defaultdict(list)
+    basket_start = start_hour - max(BASKET_TREND_WINDOWS)
+    for coin, history in sorted((basket_coins | trading_coins).items()):
         if excluded_symbol(history.coin) or not history.bars:
             continue
+        basket_member = coin in basket_coins
+        first_decision = basket_start if basket_member else start_hour
         recent: deque[Bar] = deque(maxlen=1 + max(RETURN_WINDOWS))
         compression = {window: _CompressionHistory() for window in (12, 24)}
         funding = _hourly_funding(history)
@@ -195,7 +314,7 @@ def build_frames(
                     rank = series.add((bounds.high - bounds.low) / prior[-1].close)
                     if rank is not None:
                         percentiles[window] = rank
-            if hour < start_hour or len(recent) < 12:
+            if hour < first_decision or len(recent) < 12:
                 continue
             # Young markets use only the history they could have accumulated since listing.
             turnover_window = 24 if age is None else min(age, 24)
@@ -219,6 +338,12 @@ def build_frames(
             atr_rows = prior[-15:]
             atr = fmean(_true_range(row, prev) for prev, row in pairwise(atr_rows))
             if atr <= 0:
+                continue
+            # Require a full observed turnover window for index membership. Young
+            # trading signals can use a shorter window based on listing estimates.
+            if basket_member and len(recent) >= 24:
+                basket_members[hour].append(history)
+            if hour < start_hour or coin not in trading_coins:
                 continue
             returns = {
                 window: log(bar.close / closed[-1 - window].close)
@@ -252,6 +377,11 @@ def build_frames(
                 compression_percentiles=percentiles,
                 listing_peak=listing_peak,
             )
+    for hour, trends in _basket_trends(basket_members, start_hour, end_hour).items():
+        if hour in frames:
+            frames[hour] = {
+                coin: replace(frame, basket_trends=trends) for coin, frame in frames[hour].items()
+            }
     return frames
 
 
@@ -275,21 +405,25 @@ def _order(
 ) -> OrderPlan:
     close = frame.bar.close
     limit = close - side * offset * frame.atr if price is None else price
-    exit_settings = dict(variant.settings)
+    settings = dict(variant.settings)
+    stop_atr = settings.get("stop_atr", stop)
+    target_r = settings.get("target_r")
+    if target_r is not None:
+        target = target_r * stop_atr
     if variant.mode == "ioc":
-        limit = close * (1 + side * IOC_LIMIT_BPS / 10_000)
+        limit = close * (1 + side * settings.get("ioc_limit_bps", IOC_LIMIT_BPS) / 10_000)
         ttl = 0
     return OrderPlan(
         coin=frame.coin,
         side=side,
         limit=limit,
         atr=frame.atr,
-        stop_atr=exit_settings.get("stop_atr", stop),
+        stop_atr=stop_atr,
         target_atr=target,
-        hold_hours=int(exit_settings.get("hold_hours", hold)),
+        hold_hours=int(settings.get("hold_hours", hold)),
         ttl_hours=ttl,
         mode=variant.mode,
-        trailing_atr=exit_settings.get("trailing_atr", trail),
+        trailing_atr=settings.get("trailing_atr", trail) if target_r is None else None,
         target_price=target_price,
     )
 
@@ -427,6 +561,12 @@ def _ranked_basket(market: list[SignalFrame], window: int) -> list[tuple[float, 
     return sorted(scores, key=lambda item: (item[0], item[1].coin))
 
 
+def _pair_spread(ranks: list[tuple[float, SignalFrame]], legs_per_side: int) -> float:
+    return fmean(score for score, _ in ranks[-legs_per_side:]) - fmean(
+        score for score, _ in ranks[:legs_per_side]
+    )
+
+
 def _pair_idea(
     market: list[SignalFrame],
     previous: list[SignalFrame],
@@ -439,23 +579,23 @@ def _pair_idea(
     if interval and hour % interval != 0:
         return None
     ranks = _ranked_basket(market, window)
-    if len(ranks) < MINIMUM_BASKET_SIZE:
-        return None
-    bottom, laggard = ranks[0]
-    top, leader = ranks[-1]
-    spread = top - bottom
     trigger = settings["multiple"]
-    if spread < trigger:
+    legs_per_side = int(settings.get("legs_per_side", 1))
+    minimum = max(MINIMUM_BASKET_SIZE, 2 * legs_per_side)
+    if len(ranks) < minimum or _pair_spread(ranks, legs_per_side) < trigger:
         return None
     if not interval:
         previous_ranks = _ranked_basket(previous, window)
-        if len(previous_ranks) < MINIMUM_BASKET_SIZE:
+        if len(previous_ranks) < minimum or _pair_spread(previous_ranks, legs_per_side) >= trigger:
             return None
-        if previous_ranks[-1][0] - previous_ranks[0][0] >= trigger:
-            return None
-    legs = (
-        _order(leader, variant, 1, stop=1.8, target=None, hold=12, ttl=3),
-        _order(laggard, variant, -1, stop=1.8, target=None, hold=12, ttl=3),
+    direction = int(settings.get("direction", 1))
+    legs = tuple(
+        _order(frame, variant, side, stop=1.8, target=None, hold=12, ttl=3)
+        for side, ranks_on_side in (
+            (direction, reversed(ranks[-legs_per_side:])),
+            (-direction, ranks[:legs_per_side]),
+        )
+        for _, frame in ranks_on_side
     )
     return TradePlan(legs, variant.name) if all(leg.limit > 0 for leg in legs) else None
 
@@ -579,6 +719,15 @@ def ideas(
                     and sum(change * item[1].side > 0 for change in returns) / len(returns)
                     >= settings["basket_breadth"]
                 ]
+        if settings.get("basket_trend"):
+            ranked = [
+                (score, leg)
+                for score, leg in ranked
+                if all(
+                    leg.side * frames[hour][leg.coin].basket_trends.get(window, 0) > 0
+                    for window in BASKET_TREND_WINDOWS
+                )
+            ]
         if ranked:
             plans = [
                 TradePlan((leg,), variant.name)

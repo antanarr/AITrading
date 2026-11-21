@@ -139,20 +139,29 @@ def net_without_both(metrics):
 
 
 def study_period(archive, start, end, selected, minimum_turnover, limits, include_quarters=False):
-    histories, coverage = load_archive(archive, end, include_quarters)
+    basket_histories, coverage = load_archive(archive, end, include_quarters)
     incomplete_funding = [
-        coin for coin in histories if coverage["markets"][coin]["missing_funding_for_hourly"]
+        coin for coin in basket_histories if coverage["markets"][coin]["missing_funding_for_hourly"]
     ]
-    for coin in incomplete_funding:
-        del histories[coin]
+    histories = {
+        coin: history
+        for coin, history in basket_histories.items()
+        if coin not in incomplete_funding
+    }
     coverage["excluded_incomplete_funding"] = sorted(incomplete_funding)
     if not histories:
         raise ValueError(f"No archived markets ending before {hour_date(end)}")
     if not any(start in history.bars and end - 1 in history.bars for history in histories.values()):
         raise ValueError("No archived market spans the selected evaluation period")
-    if any(excluded_symbol(coin) for coin in histories):
+    if any(excluded_symbol(coin) for coin in basket_histories):
         raise ValueError("Excluded asset found in research inputs")
-    frames = build_frames(histories, start, end, minimum_turnover=minimum_turnover)
+    frames = build_frames(
+        histories,
+        start,
+        end,
+        minimum_turnover=minimum_turnover,
+        basket_histories=basket_histories,
+    )
     return {
         "start": start,
         "end": end,
@@ -217,7 +226,11 @@ def buy_and_hold(histories, eligible, start, end, limits):
 
 def shortlist(discovery, validation):
     prior = {row["variant"]["name"]: row for row in discovery}
-    passing = [row for row in validation if row["qualification"]["pass"]]
+    passing = [
+        row
+        for row in validation
+        if row["qualification"]["pass"] and prior[row["variant"]["name"]]["stress"]["net"] > 0
+    ]
     passing.sort(
         key=lambda row: (
             -row["stress"]["net_without_best_coin"],
@@ -280,7 +293,9 @@ def explore(args):
         if len(selection) != len(set(args.variants)):
             raise ValueError("Unrecognized candidate name")
     selection.extend(retest_variant(value, menu) for value in args.retest)
-    limits = RiskLimits()
+    if not isfinite(args.initial_equity) or args.initial_equity <= 0:
+        raise ValueError("Initial research equity must be positive and finite")
+    limits = RiskLimits(initial_equity=args.initial_equity)
     early = study_period(
         args.archive, discovery, validation, selection, args.minimum_turnover, limits, args.quarters
     )
@@ -317,7 +332,9 @@ def freeze(args):
         raise ValueError("Research taxonomy changed since the candidate study ran")
     candidates = shortlist(data["discovery"]["results"], data["validation"]["results"])
     if not candidates:
-        raise ValueError("No candidate met its qualification track in Validation")
+        raise ValueError(
+            "No candidate qualified in Validation with positive stress net in Discovery"
+        )
     if candidates != data["candidates"]:
         raise ValueError("Study candidates no longer match the qualifying results")
     now = current_hour()
@@ -397,6 +414,12 @@ def main():
     initial.add_argument("--validation-start", type=date.fromisoformat, required=True)
     initial.add_argument("--end", type=date.fromisoformat, required=True)
     initial.add_argument("--minimum-turnover", type=float, default=1_000_000)
+    initial.add_argument(
+        "--initial-equity",
+        type=float,
+        default=RiskLimits().initial_equity,
+        help="Hypothetical USDC equity. Does not affect live or paper balances.",
+    )
     initial.add_argument("--quarters", action="store_true")
     initial.add_argument("--variants", nargs="+")
     initial.add_argument("--retest", action="append", default=[], metavar="NAME:KEY=VALUE")
