@@ -114,9 +114,20 @@ def allocation_summary(metrics, start, end, initial_equity):
     }
 
 
-def run_book(histories, plans, start, end, limits, slots=None, exit_signal=None, profit_lock=0.0):
+def run_book(
+    histories,
+    plans,
+    start,
+    end,
+    limits,
+    slots=None,
+    exit_signal=None,
+    profit_lock=0.0,
+    *,
+    cost_models=COSTS,
+):
     values = {}
-    for label, costs in COSTS.items():
+    for label, costs in cost_models.items():
         score = replay(
             histories,
             plans,
@@ -158,20 +169,36 @@ def evaluate(
     daily_offset=0,
     only=None,
     risk_fraction=0.01,
+    liquidity_top_n=None,
+    enhanced_trend=False,
 ):
     all_histories, coverage = load_archive(archive, end, include_quarters=True)
     histories, rejected = usable_histories(all_histories, coverage)
     if not histories:
         raise ValueError("No markets with usable price and funding history")
-    plans = build_plans(histories, start, end, minimum_turnover, daily_offset=daily_offset)
-    exits = pair_diagnostics = None
+    plans = build_plans(
+        histories,
+        start,
+        end,
+        minimum_turnover,
+        daily_offset=daily_offset,
+        liquidity_top_n=liquidity_top_n,
+    )
+    exits = {}
+    pair_diagnostics = trend_diagnostics = None
     if include_pairs:
         from .public_pairs import PAIR_VARIANT, build_pair_plans, pair_exit_signal
 
         plans[PAIR_VARIANT], pair_diagnostics = build_pair_plans(
             histories, start, end, minimum_turnover=minimum_turnover
         )
-        exits = pair_exit_signal(histories, pair_diagnostics)
+        exits[PAIR_VARIANT] = pair_exit_signal(histories, pair_diagnostics)
+    if enhanced_trend:
+        from .liquid_trend import BASELINE_VARIANT, ENHANCED_VARIANT, build_liquid_trend
+
+        plans[ENHANCED_VARIANT], exits[ENHANCED_VARIANT], trend_diagnostics = build_liquid_trend(
+            histories, plans[BASELINE_VARIANT], start, end, daily_offset=daily_offset
+        )
     if only:
         plans = {name: plans[name] for name in only}
     marked = {
@@ -195,7 +222,7 @@ def evaluate(
                 start,
                 end,
                 risk,
-                exit_signal=exits if name == "major-alt-beta-pairs" else None,
+                exit_signal=exits.get(name),
                 profit_lock=profit_lock,
             )
             for name, signals in plans.items()
@@ -227,6 +254,7 @@ def evaluate(
         "excluded_market_data": rejected,
         "signal_markets": marked,
         "pair_diagnostics": pair_diagnostics,
+        "trend_diagnostics": trend_diagnostics,
         "capital_comparison": books,
     }
 
@@ -258,6 +286,8 @@ def run(args):
         raise ValueError("Starting equity must be positive and finite")
     if not isfinite(args.risk_fraction) or not 0 < args.risk_fraction <= 1:
         raise ValueError("The risk fraction must be positive and no greater than one")
+    if args.enhanced_trend and args.liquidity_top_n != 20:
+        raise ValueError("The enhanced trend candidate uses the trailing top 20 universe")
     report = {
         "strategies": [asdict(variant) for variant in variants()],
         "shared_sleeves": SLEEVE_PAIRS,
@@ -265,6 +295,7 @@ def run(args):
         "profit_lock_fraction": args.profit_lock_fraction,
         "daily_candle_utc_offset": args.daily_offset,
         "risk_fraction": args.risk_fraction,
+        "liquidity_top_n": args.liquidity_top_n,
         "discovery": evaluate(
             args.archive,
             start,
@@ -276,6 +307,8 @@ def run(args):
             args.daily_offset,
             args.only,
             args.risk_fraction,
+            args.liquidity_top_n,
+            args.enhanced_trend,
         ),
         "validation": evaluate(
             args.archive,
@@ -288,6 +321,8 @@ def run(args):
             args.daily_offset,
             args.only,
             args.risk_fraction,
+            args.liquidity_top_n,
+            args.enhanced_trend,
         ),
     }
     report["qualification"] = summarize_qualification(report["discovery"], report["validation"])
@@ -316,8 +351,23 @@ def main(argv=None):
     parser.add_argument("--profit-lock-fraction", type=float, default=0.25)
     parser.add_argument("--daily-offset", type=int, default=0)
     parser.add_argument("--risk-fraction", type=float, default=0.01)
-    parser.add_argument("--only", nargs="+", choices=tuple(item.name for item in variants()))
-    run(parser.parse_args(argv))
+    parser.add_argument(
+        "--liquidity-top-n",
+        type=int,
+        help="Rank eligible markets by turnover in the preceding 30 days",
+    )
+    parser.add_argument("--enhanced-trend", action="store_true")
+    parser.add_argument("--only", nargs="+")
+    args = parser.parse_args(argv)
+    if args.only:
+        supported = {item.name for item in variants()}
+        if args.enhanced_trend:
+            from .liquid_trend import ENHANCED_VARIANT
+
+            supported.add(ENHANCED_VARIANT)
+        if set(args.only) - supported:
+            parser.error("Unknown or disabled strategy in --only")
+    run(args)
 
 
 if __name__ == "__main__":

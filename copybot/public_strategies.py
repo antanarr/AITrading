@@ -26,6 +26,7 @@ DONCHIAN_SOURCE = (
 )
 
 WARMUP_HOURS = 22 * 24
+LIQUIDITY_LOOKBACK_HOURS = 30 * 24
 MINIMUM_ACTIVE_HOURS = 9
 ATR_BARS = 14
 IOC_CAP_BPS = 40
@@ -167,6 +168,7 @@ def build_plans(
     minimum_turnover: float = 1_000_000,
     *,
     daily_offset: int = 0,
+    liquidity_top_n: int | None = None,
 ) -> dict[str, dict[int, list[TradePlan]]]:
     """Rank every eligible public entry by signal distance in units of ATR.
 
@@ -180,10 +182,13 @@ def build_plans(
         raise ValueError("Expected finite positive minimum turnover")
     if type(daily_offset) is not int or not 0 <= daily_offset < 24:
         raise ValueError("Daily candle offset must be an integer UTC hour")
+    if liquidity_top_n is not None and (type(liquidity_top_n) is not int or liquidity_top_n <= 0):
+        raise ValueError("The liquid universe count must be a positive integer")
     rules = {"hummingbot-macd-bb": macd_bb, "freqtrade-ema-obv": ema_obv, "donchian-20": donchian}
     configs = variants()
     ranked = {config.name: defaultdict(list) for config in configs}
-    first = max(0, start - WARMUP_HOURS)
+    first = max(0, start - (LIQUIDITY_LOOKBACK_HOURS if liquidity_top_n else WARMUP_HOURS))
+    turnover = {}
     for history in histories.values():
         coin = history.coin
         if excluded_symbol(coin) or ":" in coin or not history.bars:
@@ -194,6 +199,13 @@ def build_plans(
         daily.index += daily_offset
         hourly.index += 1
         eligible = _liquid(hourly, minimum_turnover)
+        if liquidity_top_n is not None:
+            turnover[coin] = (
+                (hourly.close * hourly.volume)
+                .rolling(LIQUIDITY_LOOKBACK_HOURS)
+                .sum()
+                .where(eligible)
+            )
         resolutions = {1: hourly, 4: four_hour, 24: daily}
         candles = {period: bars.assign(atr=_atr(bars)) for period, bars in resolutions.items()}
         for family, resolution in sorted({(cfg.family, cfg.resolution_hours) for cfg in configs}):
@@ -220,6 +232,21 @@ def build_plans(
                     if leg.limit > 0:
                         ranked[config.name][int(signal.Index)].append((signal.strength, leg))
 
+    if turnover:
+        ranks = (
+            pd.DataFrame(turnover)
+            .sort_index(axis=1)
+            .rank(
+                axis=1,
+                ascending=False,
+                method="first",
+            )
+        )
+        for decisions in ranked.values():
+            for hour, entries in decisions.items():
+                decisions[hour] = [
+                    item for item in entries if ranks.at[hour, item[1].coin] <= liquidity_top_n
+                ]
     return {
         name: {
             hour: [

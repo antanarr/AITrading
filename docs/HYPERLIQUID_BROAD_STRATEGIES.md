@@ -149,3 +149,56 @@ The earlier [directional study](HYPERLIQUID_DIRECTIONAL_STUDY.md) used
 fixed 100 USDC model stakes. Use commits `0240e40` and `7a6da70` to
 reproduce those fixtures and historical results. The current walk-forward
 command sizes from the simulated balance and volatility.
+
+## Liquidity-ranked daily trend
+
+The follow-up tests the highest 20 markets by trailing 30-day turnover
+at the decision time. Ranking includes eligible markets even when they
+have no breakout. Both variants enter on a 20-day breakout. The
+enhancement requires alignment with the preceding 50 completed daily
+closes and uses a 10-day opposite-channel exit. It retains the 2 ATR
+protective stop and 10-day maximum hold. It uses the same equity risk,
+execution caps, funding and profit budget as the previous broad study.
+
+| Enhanced strategy | $300 earlier | $300 later | $500 earlier | $500 later |
+| --- | ---: | ---: | ---: | ---: |
+| Midnight UTC | +27.49 | +15.93 | +55.63 | +24.72 |
+| 08:00 UTC | +20.91 | +14.06 | +29.74 | +24.90 |
+| 16:00 UTC | +36.75 | +4.56 | +60.36 | +0.86 |
+
+All amounts are USDC after stress costs. At midnight UTC and 500 USDC,
+the strategy won 14 of 19 Validation trades, with 19.41 USDC estimated
+intrabar drawdown and 12.34 USDC net after jointly excluding its top
+trade and asset. The midnight run is one trade short of the earlier
+20-trade qualification minimum. The 16:00 UTC Validation run turns
+negative after the outlier exclusion at 500 USDC. The simpler top-20
+variant at midnight UTC lost 47.97 USDC in Discovery and earned 26.47
+in Validation at the 500 USDC balance.
+
+The fixed midnight rule was also run against 13 major Binance USD-M
+contracts from January 2024 to May 24, 2026 UTC, exclusive. The
+archive includes 272,688 hourly bars and 34,086 observed funding
+settlements. The enhanced strategy earned **33.32 USDT** over 239
+trades starting from 500 USDT in the continuous stressed run. These
+results come from a separate market archive and replay. The
+continuous estimated intrabar drawdown was 132.12 USDT, and results
+excluding its top trade and asset were −3.15 USDT. Separate tests
+reset to 500 USDT at each period and earned 86.39 USDT in 2024, lost
+36.60 in 2025 and lost 6.05 from January through May 23, 2026. The
+reference replay estimates Binance fills with candle proxies and
+assumes 5 bps taker fees. [Binance public data](https://github.com/binance/binance-public-data#futures)
+
+This is a paper candidate with observed after-cost profitability
+and uneven returns by market period. The Reserve and live worker
+remain separate.
+
+```sh
+python -m copybot.broad_study state/backruns/2026-11-21-broad \
+  state/backruns/2026-11-21-broad/top-20-sma.json --capital 300 500 \
+  --liquidity-top-n 20 --enhanced-trend \
+  --only donchian-20-24h-ioc-top20-sma50-channel10
+python -m copybot.binance_regime_archive state/backruns/2026-11-21-binance-majors \
+  --reuse state/backruns/2026-11-20-directional/transfer
+python -m copybot.liquid_trend_reference state/backruns/2026-11-21-binance-majors \
+  state/backruns/2026-11-21-binance-majors/liquid-trend-continuous.json --capital 500
+```

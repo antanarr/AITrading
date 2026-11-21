@@ -99,3 +99,22 @@ def test_daily_boundary_uses_only_closed_shifted_candles():
     assert valid[name][boundary]
     midnight = build_plans({"SOL": result}, boundary, boundary + 1, daily_offset=0)
     assert not midnight[name]
+
+
+def test_top_liquidity_ranks_all_markets_using_only_closed_hours():
+    boundary = 50_000
+    trending = market("SOL", boundary, 110)
+    quiet = market("ETH", boundary, 100)
+    btc = market("BTC", boundary, 100)
+    for coin, volume in ((trending, 50_000), (quiet, 150_000), (btc, 1_000_000)):
+        coin.bars.update(
+            {hour: Bar(100, 101, 99, 100, volume) for hour in range(boundary - 720, boundary - 168)}
+        )
+        coin.bars.update({hour: replace(bar, volume=volume) for hour, bar in coin.bars.items()})
+    trending.bars[boundary] = Bar(110, 110, 110, 110, 1_000_000_000)
+    universe = {item.coin: item for item in (trending, quiet, btc)}
+    name = "donchian-20-24h-ioc"
+    ranks = build_plans(universe, boundary, boundary + 1, daily_offset=8, liquidity_top_n=1)
+    assert not ranks[name].get(boundary)
+    ranks = build_plans(universe, boundary, boundary + 1, daily_offset=8, liquidity_top_n=2)
+    assert [plan.legs[0].coin for plan in ranks[name][boundary]] == ["SOL"]
