@@ -117,6 +117,35 @@ of profitable test blocks in each period. The learner remains offline.
 The full results include base and stress P&L, funding, friction, risk,
 win rate, market time, concentration checks and per-fold outcomes.
 
+## Earlier market cycles
+
+As a separate experiment, chart models train on Binance USD-M data from
+January 2024 through May 24, 2026. The Hyperliquid decisions and exits
+still come from the same development archive. The comparison is
+restricted to symbols with eligible history on both venues. It scores a
+Hyperliquid-only chart model, a Hyperliquid-only model with the official
+context inputs, a fixed model trained on the earlier Binance bars, and
+a 50/50 blend of the last two. The fixed model learns from gross chart
+returns because its input has no funding history. The test applies
+Hyperliquid research funding, lot sizes and friction to all four policies.
+This is a transfer test on matched contracts, with selection bias and
+possible differences in venue liquidity and participant behavior.
+
+The source archive contains 176,302 hourly candles across 11 matched
+contracts. After eligibility and cutoff checks, there were 175,877
+earlier-venue labels at 12h and 175,481 at 48h. The matched Hyperliquid
+study contained 30,352 eligible market-hour decisions.
+
+At 48h, the older-venue gradient booster made 51.06 and 51.25 USDC in
+Validation after stress costs. It lost 78.39 and 69.36 in Discovery.
+The blended 48h logistic model made 97.07 and 40.55 in Validation,
+then failed the historical gate with Discovery losses of 3.61 and
+95.47. At 12h the older-venue booster improved Validation AUC to
+0.568 from 0.516 for the matched Hyperliquid chart model, and still
+lost 16.26 on one Validation clock. Adding these earlier chart regimes
+did not produce a qualifying model or establish that cross-venue
+funding, archived delistings, or richer inputs would transfer.
+
 ## Reproduce
 
 ```sh
@@ -129,6 +158,10 @@ python -m copybot.directional_study state/backruns/2026-11-21-meme \
 python -m copybot.directional_study state/backruns/2026-11-21-meme \
   state/backruns/directional-volatility.json --context state/backruns/context.jsonl \
   --modes stationary --horizons 12 24 48 --tails --relative-baskets volatility
+python -m copybot.directional_transfer state/backruns/binance-transfer
+python -m copybot.directional_transfer_study state/backruns/2026-11-21-meme \
+  state/backruns/binance-transfer state/backruns/context.jsonl \
+  state/backruns/transfer-replay.json
 ```
 
 Use `copybot.directional_positioning` to download the positioning archive

@@ -95,9 +95,9 @@ def realized_risk(rows, horizon):
     return (rows.tech_1h_realized_vol * np.sqrt(horizon)).clip(lower=0.003)
 
 
-def models(train, test, columns, horizon, relative=None):
+def models(train, test, columns, horizon, relative=None, *, gross_only=False):
     price = train[f"price_return_{horizon}"]
-    carry = train[f"funding_return_{horizon}"]
+    adjusted = price if gross_only else price + train[f"funding_return_{horizon}"]
     observed = price.ne(0)
     if observed.sum() < 100 or price[observed].gt(0).nunique() != 2:
         raise ValueError("Fold requires at least 100 non-flat training labels and both directions")
@@ -127,14 +127,14 @@ def models(train, test, columns, horizon, relative=None):
         logit.fit(x.loc[observed], y)
         boost.fit(x.loc[observed], y)
         # Bound extreme historical labels in the fit. Evaluation uses raw returns.
-        mean_return.fit(x, (price + carry).clip(-0.10, 0.10))
+        mean_return.fit(x, adjusted.clip(-0.10, 0.10))
         predictions = {
             "logistic": logit.predict_proba(x_test)[:, 1],
             "boost": boost.predict_proba(x_test)[:, 1],
             "return": mean_return.predict(x_test),
         }
         if relative:
-            outcome = price + carry
+            outcome = adjusted
             if relative == "volatility":
                 outcome = outcome / realized_risk(train, horizon)
             hourly = outcome.groupby(train.hour)
