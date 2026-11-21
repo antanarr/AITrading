@@ -51,6 +51,7 @@ class OrderPlan:
     trailing_atr: float | None = None
     target_price: float | None = None
     weight: float = 1.0
+    signal_strength: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

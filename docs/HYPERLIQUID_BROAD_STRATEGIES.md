@@ -202,3 +202,72 @@ python -m copybot.binance_regime_archive state/backruns/2026-11-21-binance-major
 python -m copybot.liquid_trend_reference state/backruns/2026-11-21-binance-majors \
   state/backruns/2026-11-21-binance-majors/liquid-trend-continuous.json --capital 500
 ```
+
+## Leverage with the same collateral
+
+Each policy started with 500 USDC and kept the same collateral allocation
+rules. Larger multipliers increased notional exposure and the amount each
+stop could lose. Lot sizes, minimum notional, exchange caps and the account
+balance after each trade can change which opportunities are filled.
+Strict 5× skips contracts capped below 5×. Capped 5× uses the contract's
+maximum if it is lower. The mixed policy uses 1× when more than two
+signals arrive together or a same-side position is already open. Otherwise
+it uses 3×, or 5× when the breakout exceeds the channel by at least
+0.5 ATR, subject to the contract cap. The breakout distance is a
+heuristic. It has no calibrated win probability.
+
+The replay applies the low-tier maintenance formula using archived census
+caps. Historical mark prices and live order-book fills are unavailable.
+Traded-price candles stand in for mark prices, and an ambiguous candle
+crossing both barriers is scored as liquidation first. Liquidation is
+modeled as loss of the full posted collateral plus the entry fee. The
+cascade scenario shifts the proxy mark 1% against the position and adds
+3% slippage to protective stop exits. These shocks are stress assumptions.
+[Hyperliquid liquidation mechanics](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations)
+
+Gemini's hostile review focused on the reused research windows,
+dependence among same-day positions, clock sensitivity, and the proximity
+of protective stops to liquidation. The leverage replay counts entry-day
+clusters and reports results without the best cluster as well as the
+existing trade and coin concentration checks.
+
+### Midnight UTC results on 500 USDC
+
+| Policy | Earlier stress net | Later stress net | Later intrabar drawdown | Earlier / later liquidation proxies | Later cascade net |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 1× | +55.63 | +24.72 | 19.41 | 0 / 0 | +24.19 |
+| 3× | +117.21 | +76.65 | 57.40 | 1 / 0 | +74.71 |
+| Strict 5× | +375.26 | +67.85 | 106.85 | 1 / 3 | +27.74 |
+| Capped 5× | +269.39 | +89.72 | 94.86 | 2 / 2 | +48.08 |
+| Mixed | +61.84 | +14.78 | 28.78 | 0 / 0 | +13.16 |
+
+All policies had 19 completed later-window trades across 9–12 entry
+days. Median posted collateral was 21.68–23.67 USDC per trade in that
+window. The mixed policy used 1× on 17 trades and 3× on two. Strict
+5× reached six modeled later liquidations under the cascade scenario,
+and capped 5× reached five. The midnight 3× replay had 11 later trades
+whose initial stop plus the extra slippage allowance used at least 75%
+of the distance to modeled liquidation.
+
+At 16:00 UTC, later stress net was +0.86 USDC at 1×, −36.51 at 3×,
+−89.42 at strict 5×, −106.92 at capped 5× and −1.83 in the mixed
+policy. All five lost money at this boundary in the cascade scenario.
+
+As an older-regime sensitivity, the Binance candle archive was replayed
+with the same collateral rules, 5 bps taker fees and an assumed 10%
+maintenance charge per contract. That last assumption is a scenario,
+since the archive lacks historical Binance margin tiers and mark prices.
+On a continuous 500 USDT run, net was +33.32 USDT at 1×, −52.46 at 3×,
+−481.55 at 5× and +16.29 in the mixed policy. Removing the best trade
+and coin made the mixed result −45.70 USDT. Both 3× and the mixed policy
+lost more than 150 USDT in the standalone 2025 replay.
+
+The higher leverage increased midnight profit in several replays.
+Changing the daily boundary or testing on the older archive exposed
+large losses. The midnight variants are below the 20-trade minimum.
+No policy was frozen for the Reserve.
+
+```sh
+python -m copybot.liquid_trend_leverage state/backruns/2026-11-21-broad \
+  state/backruns/2026-11-21-broad/daily-top-20-leverage-cascade.json
+```

@@ -125,6 +125,7 @@ def run_book(
     profit_lock=0.0,
     *,
     cost_models=COSTS,
+    isolated_margin=None,
 ):
     values = {}
     for label, costs in cost_models.items():
@@ -139,6 +140,7 @@ def run_book(
             exit_signal=exit_signal,
             data_gap_proxy=True,
             profit_lock_fraction=profit_lock,
+            isolated_margin=isolated_margin,
         )
         score["net_without_best_trade_and_coin"] = net_without_both(score)
         score["allocation"] = allocation_summary(score, start, end, limits.initial_equity)

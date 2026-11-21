@@ -215,6 +215,7 @@ def load_archive(path: Path, end_hour: int, include_quarters: bool = False):
         funding_window = {hour + 1 for hour in bars if hour < last} if bars else set()
         coverage[coin] = {
             "status": status,
+            "census_max_leverage": meta.get("maxLeverage"),
             "delisted_in_census": delisted,
             "category": category,
             "identity": record or None,

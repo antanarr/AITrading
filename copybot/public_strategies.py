@@ -158,6 +158,7 @@ def _order(candidate, coin: str, config: PublicVariant) -> OrderPlan:
         ttl_hours=ttl,
         mode=config.mode,
         trailing_atr=config.trailing_atr,
+        signal_strength=float(candidate.strength),
     )
 
 

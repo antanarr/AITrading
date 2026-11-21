@@ -3,7 +3,7 @@ from dataclasses import replace
 
 import pytest
 
-from copybot.research_execution import BASE, STRESS, CostModel, RiskLimits, replay
+from copybot.research_execution import BASE, STRESS, CostModel, IsolatedMargin, RiskLimits, replay
 from copybot.research_models import HOUR_MS, Bar, Funding, MarketHistory, OrderPlan, TradePlan
 
 COSTLESS = CostModel("costless", 0, 0, 0, maker_fee_bps=0, taker_fee_bps=0)
@@ -27,6 +27,69 @@ def run(market, plan=None, *, end=4, costs=BASE, limits=None):
     return replay(
         {market.coin: market}, {0: [bet]}, 0, end, costs=costs, limits=limits or RiskLimits()
     )
+
+
+def isolated_replay(bars, *, side=1, leverage=5, cap=5, costs=COSTLESS, mark_bps=0):
+    market = history(bars)
+    plan = TradePlan((order(side=side, mode="ioc", target_atr=None),), "isolated")
+    return replay(
+        {market.coin: market},
+        {0: [plan]},
+        0,
+        len(bars),
+        costs=costs,
+        limits=RiskLimits(initial_equity=500, max_leg_fraction=0.25),
+        isolated_margin=IsolatedMargin({market.coin: cap}, lambda *_: leverage, mark_bps),
+    )
+
+
+@pytest.mark.parametrize("leverage", [1, 3, 5])
+def test_isolated_leverage_uses_same_collateral_and_scales_exposure(leverage):
+    score = isolated_replay({0: bar(), 1: bar(101, 101, 101, 101)}, leverage=leverage)
+    leg = score["trades"][0]["legs"][0]
+    assert leg["collateral"] == pytest.approx(125)
+    assert leg["size"] == pytest.approx(1.25 * leverage)
+    assert score["net"] == pytest.approx(1.25 * leverage)
+
+
+def test_isolated_leverage_above_the_market_cap_is_rejected():
+    score = isolated_replay({0: bar()}, cap=3)
+    assert score["count"] == 0
+    assert score["submission_diagnostics"]["replay"]["rejected"]["venue_leverage"] == 1
+
+
+@pytest.mark.parametrize(
+    ("side", "execution_bar", "reason", "expected_threshold"),
+    [
+        (1, bar(85, 86, 84, 85), "liquidation proxy at open", 80 / 0.9),
+        (-1, bar(100, 112, 99, 101), "liquidation proxy intrabar", 120 / 1.1),
+    ],
+)
+def test_isolated_liquidation_takes_precedence_over_stop_and_reconciles_loss(
+    side, execution_bar, reason, expected_threshold
+):
+    score = isolated_replay({0: bar(), 1: execution_bar}, side=side)
+    leg = score["trades"][0]["legs"][0]
+    assert leg["reason"] == reason
+    assert leg["initial_liquidation_threshold"] == pytest.approx(expected_threshold)
+    assert score["net"] == pytest.approx(-125)
+    assert score["net"] == pytest.approx(
+        score["gross"]
+        + score["funding"]
+        - score["fees"]
+        - score["slippage"]
+        + score["isolated_margin"]["liquidation_adjustment"]
+    )
+
+
+def test_isolated_cascade_displaces_mark_and_applies_slippage_to_protective_stops():
+    bars = {0: bar(), 1: bar(high=100, low=89.5)}
+    regular = isolated_replay(bars)
+    cascade = isolated_replay(bars, mark_bps=100)
+    slipped = isolated_replay(bars, costs=replace(COSTLESS, adverse_stop_fill_bps=300))
+    assert regular["trades"][0]["legs"][0]["reason"] == "stop"
+    assert slipped["net"] < regular["net"]
+    assert cascade["trades"][0]["legs"][0]["reason"] == "liquidation proxy intrabar"
 
 
 def test_adaptive_sizing_uses_equity_and_withholds_profit_highs():

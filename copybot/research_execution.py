@@ -1,6 +1,7 @@
 """Replay research orders using archived public candles and funding settlements."""
 
 from collections import Counter, defaultdict
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from decimal import ROUND_CEILING, ROUND_DOWN, Decimal
 from fractions import Fraction
@@ -26,6 +27,7 @@ REJECTIONS = (
     "data_gap",
     "zero_volume",
     "expired_on_submission",
+    "venue_leverage",
 )
 
 
@@ -37,6 +39,7 @@ class CostModel:
     exit_impact_bps: float
     maker_fee_bps: float = 1.5
     taker_fee_bps: float = 4.5
+    adverse_stop_fill_bps: float = 0
 
 
 BASE = CostModel("base", half_spread_bps=3, entry_impact_bps=2, exit_impact_bps=4)
@@ -53,6 +56,15 @@ class RiskLimits:
     max_net_fraction: float = 0.60
 
 
+@dataclass(frozen=True)
+class IsolatedMargin:
+    """Optional research model for single-leg IOC orders in the lowest margin tier."""
+
+    max_leverage: Mapping[str, int]
+    select_leverage: Callable[[OrderPlan, int, int], int]
+    adverse_mark_bps: float = 0
+
+
 @dataclass
 class _Leg:
     plan: OrderPlan
@@ -66,6 +78,9 @@ class _Leg:
     entry_fee: float
     best_close: float
     last_observed: float
+    leverage: int = 1
+    maintenance_rate: float | None = None
+    initial_stop: float | None = None
     entered_ms: int | None = None
     entered_slice: int | None = None
     canceled: bool = False
@@ -82,6 +97,10 @@ class _Leg:
     @property
     def notional(self):
         return _number(self.size) * _number(self.entry)
+
+    @property
+    def collateral(self):
+        return self.notional / self.leverage
 
     def fill(self, stamp, slice_start):
         self.entered_ms = stamp
@@ -186,6 +205,9 @@ class _Sizing:
     def __init__(self, legs, costs, limits):
         self.legs = legs
         self.weights = [_number(leg.plan.weight) for leg in legs]
+        self.collateral_weights = [
+            weight / leg.leverage for leg, weight in zip(legs, self.weights, strict=True)
+        ]
         self.lots = [Fraction(1, 10**leg.history.decimals) for leg in legs]
         prices = [_number(leg.entry) for leg in legs]
         self.lot_values = [lot * price for lot, price in zip(self.lots, prices, strict=True)]
@@ -200,7 +222,7 @@ class _Sizing:
             _number(costs.maker_fee_bps) / PER_BPS if legs[0].plan.mode == "maker" else taker_fee
         )
         stop_risks = []
-        for leg, price, weight in zip(legs, prices, self.weights, strict=True):
+        for leg, price, weight in zip(legs, prices, self.collateral_weights, strict=True):
             side = leg.plan.side
             stop_fill = _number(leg.stop) * (1 - side * impact)
             stop_loss = (price - stop_fill) * side + price * entry_fee + stop_fill * taker_fee
@@ -212,7 +234,7 @@ class _Sizing:
         self.side_weights = {
             side: sum(
                 weight
-                for leg, weight in zip(legs, self.weights, strict=True)
+                for leg, weight in zip(legs, self.collateral_weights, strict=True)
                 if leg.plan.side == side
             )
             for side in (1, -1)
@@ -220,12 +242,12 @@ class _Sizing:
 
     def constraints(self, amounts):
         # Each bound is (equity fraction, reserved amount, weight) for the shared basket quantity.
-        yield self.gross_fraction, sum(amounts.values()), sum(self.weights)
+        yield self.gross_fraction, sum(amounts.values()), sum(self.collateral_weights)
         # Until every leg fills, directional exposure can reach either side's full notional.
         for side, weight in self.side_weights.items():
             if weight:
                 yield self.net_fraction, amounts[side], weight
-        yield self.leg_fraction, 0, max(self.weights)
+        yield self.leg_fraction, 0, max(self.collateral_weights)
 
     def maximum_unit(self, capital, amounts, risk_fraction):
         limits = [
@@ -262,10 +284,10 @@ class _Sizing:
         return "MIN_NOTIONAL" if maximum_unit < self.minimum_unit else "accepted"
 
 
-def _reserved_notional(reserved):
+def _reserved_collateral(reserved):
     amounts = dict.fromkeys((1, -1), Fraction(0))
     for leg in reserved:
-        amounts[leg.plan.side] += leg.notional
+        amounts[leg.plan.side] += leg.collateral
     return amounts
 
 
@@ -310,6 +332,7 @@ class _Replay:
         exit_signal=None,
         data_gap_proxy=False,
         profit_lock_fraction=0.0,
+        isolated_margin=None,
     ):
         self.histories = histories
         self.costs = costs
@@ -318,6 +341,7 @@ class _Replay:
         self.exit_signal = exit_signal
         self.data_gap_proxy = data_gap_proxy
         self.profit_lock_fraction = _number(profit_lock_fraction)
+        self.isolated_margin = isolated_margin
         self.locked_profit = Fraction(0)
         self.bets = []
         self.trades = []
@@ -336,8 +360,9 @@ class _Replay:
         self.executable_plans = []
         self.risk_fraction = _number(limits.risk_fraction)
         self.initial_equity = _number(limits.initial_equity)
+        self.peak_collateral = Fraction(0)
 
-    def prepare(self, plan, hour):
+    def prepare(self, plan, hour, signal_count, reserved):
         legs = []
         for order in plan.legs:
             history = self.histories[order.coin]
@@ -350,6 +375,22 @@ class _Replay:
             leg = _prepared_leg(order, history, opening, self.costs)
             if isinstance(leg, str):
                 return leg
+            if self.isolated_margin:
+                same_side = sum(position.plan.side == order.side for position in reserved)
+                leverage = self.isolated_margin.select_leverage(order, signal_count, same_side)
+                maximum = self.isolated_margin.max_leverage[order.coin]
+                if (
+                    type(leverage) is not int
+                    or leverage < 1
+                    or type(maximum) is not int
+                    or maximum < 1
+                ):
+                    raise ValueError("Invalid isolated leverage")
+                if leverage > maximum:
+                    return "venue_leverage"
+                leg.leverage = leverage
+                leg.maintenance_rate = 1 / (2 * maximum)
+                leg.initial_stop = leg.stop
             legs.append(leg)
         if legs[0].plan.mode == "maker" and any(leg.plan.ttl_hours == 0 for leg in legs):
             return "expired_on_submission"
@@ -366,7 +407,7 @@ class _Replay:
             outcomes[sizing.outcome(unit)] += 1
         return minimums
 
-    def submit(self, plan, hour, candidate_number):
+    def submit(self, plan, hour, candidate_number, signal_count):
         coins = {leg.coin for leg in plan.legs}
         if not coins or len(coins) != len(plan.legs):
             raise ValueError("Research bet requires one or more distinct markets")
@@ -374,13 +415,16 @@ class _Replay:
             raise ValueError("BTC and BTC aliases are excluded from this research")
         if len({leg.mode for leg in plan.legs}) != 1:
             raise ValueError("All legs of a research bet must use the same order mode")
+        if self.isolated_margin and (len(plan.legs) != 1 or plan.legs[0].mode != "ioc"):
+            raise ValueError("The isolated margin replay requires single-leg IOC orders")
 
-        legs = self.prepare(plan, hour)
+        reserved = [leg for bet in self.bets for leg in bet.legs if leg.pending or leg.open]
+        legs = self.prepare(plan, hour, signal_count, reserved)
         rejection = legs if isinstance(legs, str) else None
         if len(coins) > self.limits.max_positions and rejection is None:
             rejection = "slot_limit"
         sizing = None if rejection else _Sizing(legs, self.costs, self.limits)
-        empty_book = _reserved_notional(())
+        empty_book = _reserved_collateral(())
         empty_book_minimums = self.inspect_empty_book(sizing, rejection, empty_book)
         if empty_book_minimums:
             self.executable_plans.append(
@@ -393,7 +437,6 @@ class _Replay:
                 }
             )
 
-        reserved = [leg for bet in self.bets for leg in bet.legs if leg.pending or leg.open]
         if coins.intersection(leg.plan.coin for leg in reserved):
             self.submissions["overlap"] += 1
             return
@@ -417,14 +460,30 @@ class _Replay:
 
         total_equity = self.initial_equity + _number(self.closed_equity)
         equity = total_equity - self.locked_profit
-        amounts = _reserved_notional(reserved) if reserved else empty_book
+        amounts = _reserved_collateral(reserved) if reserved else empty_book
         unit = sizing.maximum_unit(equity, amounts, self.risk_fraction)
+        if self.isolated_margin:
+            # An isolated position's unrealized gains are unavailable to fund other entries.
+            available = (
+                self.initial_equity
+                + _number(self.net)
+                - self.locked_profit
+                - sum(amounts.values())
+                - sum(_number(leg.entry_fee) for leg in reserved)
+            )
+            entry_fee_rate = _number(self.costs.taker_fee_bps) / PER_BPS
+            weights = sum(sizing.collateral_weights) + sum(sizing.weights) * entry_fee_rate
+            unit = min(unit, available / weights)
         outcome = sizing.outcome(unit) if equity > 0 else "budget"
         self.submissions[outcome] += 1
         if outcome != "accepted":
             return
 
         sizing.assign(unit)
+        if self.isolated_margin:
+            self.peak_collateral = max(
+                self.peak_collateral, sum(amounts.values()) + sum(leg.collateral for leg in legs)
+            )
         occupancy_minimums = sizing.minimum_equities(amounts) if reserved else empty_book_minimums
         expiry = hour + min(leg.plan.ttl_hours for leg in legs)
         bet = _Bet(
@@ -439,8 +498,12 @@ class _Replay:
                 "total_equity_at_submission": float(total_equity),
                 "profit_excluded_from_sizing": float(self.locked_profit),
                 "reserved_positions": len(reserved),
-                "reserved_long_notional": float(amounts[1]),
-                "reserved_short_notional": float(amounts[-1]),
+                "reserved_long_notional": float(
+                    sum(leg.notional for leg in reserved if leg.plan.side == 1)
+                ),
+                "reserved_short_notional": float(
+                    sum(leg.notional for leg in reserved if leg.plan.side == -1)
+                ),
                 "minimum_equity_empty_book": _capital_record(empty_book_minimums),
                 "minimum_equity_at_submission_occupancy": _capital_record(occupancy_minimums),
             },
@@ -459,19 +522,57 @@ class _Replay:
         equity += _funding(leg, stamp)
         self.marks[id(leg)] = min(equity, self.marks.get(id(leg), equity))
 
-    def close(self, leg, stamp, reference, reason, *, maker=False, gap=None, terminal_proxy=False):
+    @staticmethod
+    def liquidation_price(leg, funding):
+        side = leg.plan.side
+        collateral_per_unit = leg.entry / leg.leverage + funding / leg.size
+        return (leg.entry - side * collateral_per_unit) / (1 - side * leg.maintenance_rate)
+
+    def liquidated(self, leg, stamp, proxy, *, at_open):
+        if leg.maintenance_rate is None:
+            return False
+        side = leg.plan.side
+        mark = proxy * (1 - side * self.isolated_margin.adverse_mark_bps / PER_BPS)
+        trigger = self.liquidation_price(leg, _funding(leg, stamp))
+        if not _before_stop(side, mark, trigger):
+            return False
+        reason = "liquidation proxy at open" if at_open else "liquidation proxy intrabar"
+        self.close(leg, stamp, trigger, reason, gap=proxy if at_open else None, liquidation=True)
+        return True
+
+    def close(
+        self,
+        leg,
+        stamp,
+        reference,
+        reason,
+        *,
+        maker=False,
+        gap=None,
+        terminal_proxy=False,
+        liquidation=False,
+    ):
         side = leg.plan.side
         price = (
             reference
             if maker
             else _market_exit(reference if gap is None else gap, -side, self.costs)
         )
+        if reason in ("stop", "stop gap"):
+            price *= 1 - side * self.costs.adverse_stop_fill_bps / PER_BPS
         exit_fee_bps = self.costs.maker_fee_bps if maker else self.costs.taker_fee_bps
         fees = leg.entry_fee + price * leg.size * exit_fee_bps / PER_BPS
         gross = side * leg.size * (reference - leg.entry_reference)
         slippage = side * leg.size * ((leg.entry - leg.entry_reference) + (reference - price))
         funding = _funding(leg, stamp)
         net = gross - slippage - fees + funding
+        liquidation_adjustment = 0.0
+        if self.isolated_margin:
+            # Conservatively assume no initial collateral is recovered.
+            loss = -float(leg.collateral) - leg.entry_fee
+            adjusted = loss if liquidation else max(net, loss)
+            liquidation_adjustment = adjusted - net
+            net = adjusted
         leg.result = {
             "coin": leg.plan.coin,
             "side": side,
@@ -490,6 +591,14 @@ class _Replay:
             "slippage": slippage,
             "net": net,
         }
+        if self.isolated_margin:
+            leg.result.update(
+                leverage=leg.leverage,
+                collateral=float(leg.collateral),
+                liquidation_adjustment=liquidation_adjustment,
+                initial_stop=leg.initial_stop,
+                initial_liquidation_threshold=self.liquidation_price(leg, 0),
+            )
         self.marks[id(leg)] = min(net, self.marks.get(id(leg), net))
         self.net += net
         self.terminal_proxy_exits += terminal_proxy
@@ -508,6 +617,8 @@ class _Replay:
                 if bar.volume <= 0:
                     self.deferred_exit_slices += 1
                     self.mark(leg, leg.last_observed, stamp)
+                    continue
+                if self.liquidated(leg, stamp, bar.open, at_open=True):
                     continue
                 if _before_stop(leg.plan.side, bar.open, leg.stop):
                     self.close(leg, stamp, leg.stop, "stop gap", gap=bar.open)
@@ -531,6 +642,9 @@ class _Replay:
                 leg.fill(start, start)
                 self.maker_fills += 1
             if leg.open:
+                if self.liquidated(leg, start, bar.open, at_open=True):
+                    exited_at_open = True
+                    continue
                 self.mark(leg, bar.open, start)
                 if _before_stop(side, bar.open, leg.stop):
                     self.close(leg, start, leg.stop, "stop gap", gap=bar.open)
@@ -557,6 +671,10 @@ class _Replay:
                 leg.fill(end, start)
                 self.maker_fills += 1
             if leg.open:
+                # If both barriers are crossed within a candle, assume liquidation first.
+                if self.liquidated(leg, end, worst, at_open=False):
+                    exited_inside = True
+                    continue
                 if _before_stop(side, worst, leg.stop):
                     self.close(leg, end, leg.stop, "stop")
                     exited_inside = True
@@ -669,7 +787,7 @@ class _Replay:
         self.marks.clear()
         before = self.net
         for candidate_number, plan in enumerate(plans, start=1):
-            self.submit(plan, hour, candidate_number)
+            self.submit(plan, hour, candidate_number, len(plans))
         active = []
         for bet in self.bets:
             self.run_bet(bet, hour, last=hour == end - 1)
@@ -744,7 +862,7 @@ def _summarize(engine, hours):
         peak = max(peak, current)
         realized_drawdown = max(realized_drawdown, peak - current)
     net = sum(values)
-    return {
+    summary = {
         "count": len(trades),
         "wins": len(wins),
         "win_rate": len(wins) / len(trades) if trades else 0,
@@ -792,6 +910,20 @@ def _summarize(engine, hours):
         "by_coin": dict(sorted(by_coin.items())),
         "trades": trades,
     }
+    if engine.isolated_margin:
+        legs = [leg for trade in trades for leg in trade["legs"]]
+        summary["isolated_margin"] = {
+            "peak_reserved_collateral": float(engine.peak_collateral),
+            "filled_by_leverage": dict(sorted(Counter(leg["leverage"] for leg in legs).items())),
+            "open_liquidation_proxies": sum(
+                leg["reason"] == "liquidation proxy at open" for leg in legs
+            ),
+            "intrabar_liquidation_proxies": sum(
+                leg["reason"] == "liquidation proxy intrabar" for leg in legs
+            ),
+            "liquidation_adjustment": sum(leg["liquidation_adjustment"] for leg in legs),
+        }
+    return summary
 
 
 def replay(
@@ -806,6 +938,7 @@ def replay(
     exit_signal=None,
     data_gap_proxy: bool = False,
     profit_lock_fraction: float = 0.0,
+    isolated_margin: IsolatedMargin | None = None,
 ) -> dict:
     """Submit ideas at their epoch hour and liquidate before the exclusive end hour."""
     if end < start:
@@ -817,6 +950,8 @@ def replay(
         raise ValueError("Each strategy needs a positive slot cap within the portfolio limit")
     if not 0 <= profit_lock_fraction <= 1:
         raise ValueError("Profit lock fraction must be between zero and one")
+    if isolated_margin and not 0 <= isolated_margin.adverse_mark_bps < PER_BPS:
+        raise ValueError("Adverse mark displacement must be between zero and 10,000 bps")
     engine = _Replay(
         histories,
         costs,
@@ -825,6 +960,7 @@ def replay(
         exit_signal,
         data_gap_proxy,
         profit_lock_fraction,
+        isolated_margin,
     )
     for hour in range(start, end):
         if engine.bets or hour in ideas:
