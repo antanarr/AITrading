@@ -17,7 +17,6 @@ from .meme_study import (
     qualification,
     write_json,
 )
-from .public_strategies import build_plans, variants
 from .research_data import ARCHIVE_END_HOUR, load_archive
 from .research_execution import RiskLimits, replay
 from .research_models import HOUR_MS
@@ -174,6 +173,8 @@ def evaluate(
     liquidity_top_n=None,
     enhanced_trend=False,
 ):
+    from .public_strategies import build_plans
+
     all_histories, coverage = load_archive(archive, end, include_quarters=True)
     histories, rejected = usable_histories(all_histories, coverage)
     if not histories:
@@ -281,6 +282,8 @@ def summarize_qualification(discovery, validation):
 
 
 def run(args):
+    from .public_strategies import variants
+
     start, middle, end = map(day_hour, (args.start, args.validation_start, args.end))
     if not start < middle < end <= ARCHIVE_END_HOUR:
         raise ValueError("Use only the historical Discovery and Validation data")
@@ -362,6 +365,8 @@ def main(argv=None):
     parser.add_argument("--only", nargs="+")
     args = parser.parse_args(argv)
     if args.only:
+        from .public_strategies import variants
+
         supported = {item.name for item in variants()}
         if args.enhanced_trend:
             from .liquid_trend import ENHANCED_VARIANT

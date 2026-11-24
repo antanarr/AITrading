@@ -10,9 +10,7 @@ from pathlib import Path
 from statistics import median
 
 from .broad_study import benchmark, run_book, usable_histories
-from .liquid_trend import BASELINE_VARIANT, build_liquid_trend
 from .meme_study import COSTS, day_hour, hour_date, qualification, write_json
-from .public_strategies import build_plans
 from .research_data import ARCHIVE_END_HOUR, load_archive
 from .research_execution import PER_BPS, STRESS, IsolatedMargin, RiskLimits
 from .research_models import DAY_HOURS, HOUR_MS
@@ -60,6 +58,9 @@ def diagnostics(score):
 
 
 def stage(archive, start, end, equity, offsets):
+    from .liquid_trend import BASELINE_VARIANT, build_liquid_trend
+    from .public_strategies import build_plans
+
     if not 0 < start < end <= ARCHIVE_END_HOUR:
         raise ValueError("The leverage study may only read development windows")
     all_histories, coverage = load_archive(archive, end, include_quarters=True)
