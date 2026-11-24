@@ -9,6 +9,10 @@ liquid native non-BTC perps by trailing 30-day turnover, then tests
 the 20-day breakout with prior SMA50 alignment. It keeps the 2 ATR
 protective stop, 10-day opposing channel exit and 10-day timeout.
 The code records why it skipped a decision or an individual order.
+It checks any verifiable 24-hour liquidity failure before requiring
+30-day ranking history. Short ranking gaps for the remaining markets
+get one targeted retry. The scanner suppresses entries if any
+unresolved gap could change the ranked roster.
 
 Each book sizes from its own balance with the same collateral rules.
 Both books see the same observed order depth at each decision. The

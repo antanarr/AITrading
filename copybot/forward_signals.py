@@ -187,6 +187,15 @@ def _liquidity(bars, boundary):
     return volume, eligible
 
 
+def _fails_recent_liquidity(bars, boundary):
+    latest = bars.get(boundary - HOUR_MS)
+    if latest is not None and not latest.volume:
+        return True
+    if all(stamp in bars for stamp in range(boundary - DAY_MS, boundary, HOUR_MS)):
+        return not _liquidity(bars, boundary)[1]
+    return False
+
+
 def _daily(bars, boundary):
     result = []
     for day in range(boundary - (SMA_DAYS + 1) * DAY_MS, boundary, DAY_MS):
@@ -331,6 +340,15 @@ class SignalLoader:
             and _is_complete(days, expected_first, boundary, DAY_MS)
         )
 
+    def _retry_ranking_gap(self, coin, hours, first, boundary, deadline):
+        missing = [stamp for stamp in range(first, boundary, HOUR_MS) if stamp not in hours]
+        if missing[-1] - missing[0] >= DAY_MS:
+            return hours
+        retry = self._candles(coin, missing[0], missing[-1] + HOUR_MS, deadline)
+        if any(hours[stamp] != retry[stamp] for stamp in hours.keys() & retry.keys()):
+            raise ForwardDataError("Conflicting candles during ranking history retry")
+        return {**hours, **retry}
+
     def load(
         self,
         decision_hour: int,
@@ -378,11 +396,18 @@ class SignalLoader:
             else:
                 try:
                     hours = self._candles(coin, first_rank, boundary, deadline)
+                    if _fails_recent_liquidity(hours, boundary):
+                        exclusions[coin] = "fails_closed_24h_liquidity"
+                        if coin in opens:
+                            cached[coin] = hours
+                        continue
                     if not _is_complete(hours, first_rank, boundary):
                         if self._listed_late(coin, hours, first_rank, boundary, deadline):
                             exclusions[coin] = "new_listing_with_less_than_30_days"
                             continue
-                        raise ForwardDataError("Incomplete 30-day hourly ranking history")
+                        hours = self._retry_ranking_gap(coin, hours, first_rank, boundary, deadline)
+                        if not _is_complete(hours, first_rank, boundary):
+                            raise ForwardDataError("Incomplete 30-day hourly ranking history")
                     day_volume, eligible = _liquidity(hours, boundary)
                     turnover[coin] = (
                         sum(bar.close * bar.volume for bar in hours.values()),

@@ -130,6 +130,64 @@ def test_unknown_ranking_gap_disables_all_entries_but_explicit_listing_is_exclud
     assert result.decisions["ETH"].plan is None
 
 
+def test_verified_illiquid_market_does_not_block_an_unrelated_breakout():
+    venue = Venue({"ETH": 3000, "QUIET": 100})
+    venue.closed_price["ETH"] = 110
+    venue.gap = ("QUIET", BOUNDARY - 5 * DAY_MS)
+    result = loader(venue, Clock()).load(HOUR)
+    assert result.complete and result.roster == ("ETH",)
+    assert result.exclusions["QUIET"] == "fails_closed_24h_liquidity"
+    assert result.decisions["ETH"].plan.side == 1
+    assert (
+        sum(
+            kind == "candleSnapshot" and payload["req"]["coin"] == "QUIET"
+            for kind, payload in venue.calls
+        )
+        == 1
+    )
+
+
+def test_missing_recent_candle_cannot_be_used_to_prove_low_turnover():
+    venue = Venue({"ETH": 3000, "QUIET": 100})
+    venue.closed_price["ETH"] = 110
+    venue.gap = ("QUIET", BOUNDARY - HOUR_MS)
+    result = loader(venue, Clock()).load(HOUR)
+    assert not result.complete
+    assert result.problems == {"QUIET": "Incomplete 30-day hourly ranking history"}
+    assert result.decisions["ETH"].plan is None
+
+
+def test_short_transient_data_gap_is_retried_using_only_closed_candles():
+    venue, clock = Venue({"ETH": 3000, "HYPE": 3000}), Clock()
+    venue.closed_price["ETH"] = 110
+    gap = BOUNDARY - HOUR_MS
+    venue.gap = ("HYPE", gap)
+
+    def transient_gap(kind, **payload):
+        rows = venue.info(kind, **payload)
+        if kind == "candleSnapshot" and payload["req"]["coin"] == "HYPE":
+            venue.gap = None
+        return rows
+
+    scanner = SignalLoader(
+        transient_gap, now_ms=clock.now, monotonic=clock.monotonic, sleep=clock.sleep
+    )
+    result = scanner.load(HOUR)
+    assert result.complete
+    assert result.decisions["ETH"].plan.side == 1
+    assert (
+        "candleSnapshot",
+        {
+            "req": {
+                "coin": "HYPE",
+                "interval": "1h",
+                "startTime": gap,
+                "endTime": BOUNDARY - 1,
+            }
+        },
+    ) in venue.calls
+
+
 def test_ranked_new_listing_has_no_entry_when_50_prior_days_are_missing():
     venue = Venue({"ETH": 3000})
     venue.closed_price["ETH"] = 110
