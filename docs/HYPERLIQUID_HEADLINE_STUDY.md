@@ -36,6 +36,21 @@ On 12 earlier same-clock weekday control windows, giving the looser rule a synth
 
 These are targeted case studies on two perps. Results depend on the entry and exit rules, and the timing tests cannot measure the value of headline interpretation. No strategy changes or live orders followed from this run. The Reserve stayed sealed.
 
+## Same collateral at 1×, 2×, 3×, and 5×
+
+The leverage rerun keeps the 500 starting balance, the same isolated collateral per trade, and the same entry, stop, and take-profit rules. The NVIDIA resignation trade used 124.95 of collateral at every leverage. The six-release total uses the 15-minute chart plus fast headlines with a maker target. The two NVIDIA columns use the finer five-minute replay. Figures include stressed fees, funding, spread, and slippage.
+
+| Leverage | Resignation trade size | Resignation net | Earnings net | All six releases net |
+| --- | ---: | ---: | ---: | ---: |
+| 1× | $124.95 | +$2.36 | −$2.23 | −$0.76 |
+| 2× | $249.91 | +$4.72 | −$4.45 | −$1.51 |
+| 3× | $374.86 | +$7.08 | −$6.68 | −$2.27 |
+| 5× | $624.77 | +$11.80 | −$11.13 | −$3.78 |
+
+The 5× result across all six releases was +$8.55 under base costs, −$3.78 under stressed costs, and −$60.04 in a separate gap sensitivity with an extra 3% adverse fill on stop exits and a 1% adverse adjustment to the liquidation mark proxy. With the original two-hour timeout and protective stop, the 5× six-release result was −$28.76 under stressed costs. The resignation short alone lost $12.89 with that exit.
+
+The 5× resignation trade had a stop at $159.89 and an estimated initial liquidation price of $179.86. No modeled liquidation occurred in the six headline windows or 12 comparison windows at these four leverages. The model uses the exchange’s current first-tier maintenance limits for ETH and xyz:NVDA as proxies for the historical rules. It uses traded candles as mark-price proxies, applies funding to isolated margin, and gives liquidation priority when both liquidation and a stop are crossed in one candle. It assumes the full isolated collateral is lost in that case. The fee assumptions match the original replay. [Hyperliquid liquidation rules](https://hyperliquid.gitbook.io/hyperliquid-docs/trading/liquidations)
+
 ## Reproduce from the local replay tapes
 
 ```sh
@@ -48,3 +63,14 @@ python -m copybot.headline_study "$context" "$study/nvidia-tape-5m.json" "$study
 ```
 
 The captured tapes are stored in the ignored local research directory. Add `--capture` with an unused snapshot path to obtain a fresh copy while the exchange's rolling candle history still covers these dates.
+
+The leverage runs also use the public margin snapshot saved at `state/backruns/2026-11-26-headlines/leverage/margin.json`.
+
+```sh
+for lev in 1 2 3 5; do
+  python -m copybot.headline_study "$context" "$study/tape.json" "$study/leverage/target-${lev}x.json" \
+    --maker-target --leverage "$lev" --margin-snapshot "$study/leverage/margin.json"
+  python -m copybot.headline_study "$context" "$study/nvidia-tape-5m.json" "$study/leverage/nvidia-target-${lev}x.json" \
+    --nvidia-5m --maker-target --leverage "$lev" --margin-snapshot "$study/leverage/margin.json"
+done
+```

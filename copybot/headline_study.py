@@ -13,10 +13,18 @@ from statistics import mean
 import httpx
 
 from .directional_context import EASTERN
+from .liquid_trend_leverage import CASCADE, CASCADE_MARK_BPS
 from .meme_study import write_json
 from .perps import Feed, dex_for, round_price
 from .research_data import ARCHIVE_END_HOUR, _bar, _funding
-from .research_execution import BASE, MIN_NOTIONAL, PER_BPS, QUARTER_MS, STRESS
+from .research_execution import (
+    BASE,
+    MIN_NOTIONAL,
+    PER_BPS,
+    QUARTER_MS,
+    STRESS,
+    isolated_liquidation_price,
+)
 from .research_models import HOUR_MS
 from .research_signals import _true_range
 
@@ -215,22 +223,40 @@ def choose_signal(candles, published, known=None, *, chart=False, step=QUARTER_M
     return None
 
 
-def exit_trade(candles, start, step, side, stop, target):
+def exit_trade(candles, start, step, side, stop, target, liquidation=None):
     end = start + HOLD_TIME
     for stamp in range(start, end, step):
         bar = candles[stamp]
+        if liquidation and liquidation(stamp, bar.open):
+            return stamp, bar.open, "liquidation_open"
         if bar.volume <= 0:
             continue
         adverse, favorable = (bar.low, bar.high) if side > 0 else (bar.high, bar.low)
         if side * (bar.open - stop) <= 0:
             return stamp, bar.open, "gap_stop"
+        if liquidation and liquidation(stamp + step, adverse):
+            return stamp + step, adverse, "liquidation_intrabar"
         if side * (adverse - stop) <= 0:
             return stamp + step, stop, "stop"
         if target is not None and stamp > start and side * (favorable - target) > 0:
             return stamp + step, target, "maker_target"
     if candles[end].volume <= 0:
         raise ValueError("No observed trade in the scheduled exit candle")
+    if liquidation and liquidation(end, candles[end].open):
+        return end, candles[end].open, "liquidation_open"
     return end, candles[end].open, "time"
+
+
+def funding_per_unit(candles, funding, start, end, step, side):
+    carry = 0.0
+    first_hour = (start + HOUR_MS - 1) // HOUR_MS
+    for hour in range(first_hour, (end - 1) // HOUR_MS + 1):
+        payment = funding.get(hour)
+        if payment is None:
+            raise ValueError(f"Missing funding settlement for open position at {hour}")
+        if start <= payment.time_ms < end:
+            carry -= side * candles[hour * HOUR_MS - step].close * payment.rate
+    return carry
 
 
 def simulate(
@@ -243,6 +269,9 @@ def simulate(
     step=QUARTER_MS,
     *,
     maker_target=False,
+    leverage=1,
+    max_leverage=None,
+    adverse_mark_bps=0,
 ):
     if signal is None:
         return {"status": "no_signal", "net": 0.0}
@@ -259,7 +288,7 @@ def simulate(
     units = Decimal(str(min(MAX_NOTIONAL / entry, RISK / risk_distance))).quantize(
         Decimal(1).scaleb(-decimals), rounding=ROUND_DOWN
     )
-    size = float(units)
+    size = float(units * leverage)
     if size * entry < MIN_NOTIONAL:
         return {**result, "status": "min_notional"}
     stop = entry - side * risk_distance
@@ -270,30 +299,54 @@ def simulate(
         level = Decimal(str(entry + side * MAKER_TARGET_ATR * scaled_atr))
         if level > 0:
             target = float(round_price(level, decimals, ROUND_CEILING if side > 0 else ROUND_DOWN))
-    exit_time, exit_reference, reason = exit_trade(candles, start, step, side, stop, target)
+    margin = {}
+    liquidation = None
+    if max_leverage is not None:
+        maintenance_rate = 1 / (2 * max_leverage)
+
+        def liquidation(stamp, price):
+            carry = funding_per_unit(candles, funding, start, stamp, step, side)
+            threshold = isolated_liquidation_price(entry, side, leverage, maintenance_rate, carry)
+            mark = price * (1 - side * adverse_mark_bps / PER_BPS)
+            return side * (mark - threshold) <= 0
+
+        margin = {
+            "leverage": leverage,
+            "collateral": size * entry / leverage,
+            "entry_notional": size * entry,
+            "initial_stop": stop,
+            "initial_liquidation_price": isolated_liquidation_price(
+                entry, side, leverage, maintenance_rate, 0
+            ),
+        }
+    exit_time, exit_reference, reason = exit_trade(
+        candles, start, step, side, stop, target, liquidation
+    )
     if reason == "maker_target":
         exit_price, exit_fee = exit_reference, costs.maker_fee_bps
     else:
         exit_price = exit_reference * (
             1 - side * (costs.half_spread_bps + costs.exit_impact_bps) / PER_BPS
         )
+        if reason in {"stop", "gap_stop"}:
+            exit_price *= 1 - side * costs.adverse_stop_fill_bps / PER_BPS
         exit_fee = costs.taker_fee_bps
-    fees = (entry * costs.taker_fee_bps + exit_price * exit_fee) * size * fee_multiplier / PER_BPS
+    entry_fee = entry * costs.taker_fee_bps
+    fees = (entry_fee + exit_price * exit_fee) * size * fee_multiplier / PER_BPS
     slippage = side * ((entry - first.open) + (exit_reference - exit_price)) * size
     gross = side * (exit_reference - first.open) * size
-    carry = 0.0
-    for hour in range(start // HOUR_MS, (exit_time - 1) // HOUR_MS + 1):
-        settlement = hour * HOUR_MS
-        if start <= settlement < exit_time:
-            payment = funding.get(hour)
-            if payment is None:
-                raise ValueError(f"Missing funding settlement for open position at {hour}")
-            if start <= payment.time_ms < exit_time:
-                carry -= side * size * candles[settlement - step].close * payment.rate
+    carry = funding_per_unit(candles, funding, start, exit_time, step, side) * size
+    net = gross + carry - fees - slippage
+    if margin:
+        floor = -margin["collateral"] - entry_fee * size * fee_multiplier / PER_BPS
+        settled = floor if reason.startswith("liquidation_") else max(net, floor)
+        margin["liquidation_adjustment"] = settled - net
+        net = settled
     return {
         **result,
+        **margin,
         "status": "filled",
-        "net": gross + carry - fees - slippage,
+        "net": net,
         "gross": gross,
         "funding": carry,
         "fees": fees,
@@ -306,7 +359,7 @@ def simulate(
     }
 
 
-def replay(release, snapshot, context_path, step, maker_target):
+def replay(release, snapshot, context_path, step, maker_target, leverage=1, max_leverage=None):
     candles, funding, decimals = market_tape(release, snapshot, step)
     published = release.published
     current = current_availability(release, context_path)
@@ -325,6 +378,7 @@ def replay(release, snapshot, context_path, step, maker_target):
         "high_pct": 100 * (max(bar.high for bar in reaction) / prior - 1),
         "low_pct": 100 * (min(bar.low for bar in reaction) / prior - 1),
     }
+    cost_models = (BASE, STRESS, CASCADE) if max_leverage is not None else (BASE, STRESS)
     return {
         "release": asdict(release),
         "published_ms": published,
@@ -341,8 +395,11 @@ def replay(release, snapshot, context_path, step, maker_target):
                     2 if release.coin == NVIDIA_MARKET else 1,
                     step,
                     maker_target=maker_target,
+                    leverage=leverage,
+                    max_leverage=max_leverage,
+                    adverse_mark_bps=CASCADE_MARK_BPS if cost == CASCADE else 0,
                 )
-                for cost in (BASE, STRESS)
+                for cost in cost_models
             }
             for name, signal in signals.items()
         },
@@ -367,6 +424,10 @@ def main():
     )
     parser.add_argument("--nvidia-5m", action="store_true", help="Replay only NVIDIA at 5 minutes")
     parser.add_argument("--maker-target", action="store_true", help="Add a resting 2.5 ATR target")
+    parser.add_argument(
+        "--leverage", type=int, default=1, help="Isolated leverage at fixed collateral"
+    )
+    parser.add_argument("--margin-snapshot", type=Path, help="Public first-tier leverage limits")
     args = parser.parse_args()
     if args.nvidia_5m:
         step = 5 * MINUTE_MS
@@ -374,13 +435,35 @@ def main():
     else:
         step = QUARTER_MS
         releases = [row for release in RELEASES for row in (release, *controls(release))]
+    if args.leverage < 1 or (args.leverage > 1 and args.margin_snapshot is None):
+        parser.error("Leverage must be positive and leveraged replays require --margin-snapshot")
+    margin = (
+        json.loads(args.margin_snapshot.read_text(encoding="utf-8"))
+        if args.margin_snapshot
+        else None
+    )
+    caps = {}
+    if margin is not None:
+        caps = margin["first_tier_max_leverage"]
+        for coin in {release.coin for release in releases}:
+            cap = caps.get(coin)
+            if type(cap) is not int or args.leverage > cap:
+                parser.error(f"Leverage must fit the first-tier limit for {coin}")
     if args.capture:
         if args.snapshot.exists():
             parser.error("Snapshot already exists")
         write_json(args.snapshot, capture(releases, step))
     tape = json.loads(args.snapshot.read_text(encoding="utf-8"))
     rows = [
-        replay(release, tape[release.name], args.context, step, args.maker_target)
+        replay(
+            release,
+            tape[release.name],
+            args.context,
+            step,
+            args.maker_target,
+            args.leverage,
+            caps.get(release.coin),
+        )
         for release in releases
     ]
     write_json(
@@ -391,6 +474,9 @@ def main():
             "capital": CAPITAL,
             "bar_minutes": step // MINUTE_MS,
             "maker_target_atr": MAKER_TARGET_ATR if args.maker_target else None,
+            **(
+                {"leverage": args.leverage, "margin_snapshot": margin} if margin is not None else {}
+            ),
             "events": rows,
         },
     )

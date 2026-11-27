@@ -84,3 +84,27 @@ def test_resting_target_requires_trade_through_after_entry_and_yields_to_stop():
     assert exit_trade(candles, start, step, 1, 98, 103) == (start + 3 * step, 98, "stop")
     candles[start + 2 * step] = Bar(96, 104, 95, 100, 10)
     assert exit_trade(candles, start, step, 1, 98, 103) == (start + 2 * step, 96, "gap_stop")
+
+
+def test_leverage_multiplies_notional_with_the_same_collateral_and_stop():
+    start = CUTOFF - HOUR_MS + QUARTER_MS
+    candles = {start: Bar(100, 101, 97, 99, 10)}
+    signal = {"time_ms": start, "side": 1, "atr": 1, "reference": 100}
+    baseline = simulate(candles, {}, 3, signal, STRESS, 1, max_leverage=10)
+    levered = simulate(candles, {}, 3, signal, STRESS, 1, leverage=5, max_leverage=10)
+    assert levered["entry_notional"] == pytest.approx(baseline["entry_notional"] * 5)
+    assert levered["collateral"] == pytest.approx(baseline["collateral"])
+    assert levered["initial_stop"] == baseline["initial_stop"]
+    assert levered["net"] == pytest.approx(baseline["net"] * 5)
+
+
+def test_liquidation_takes_priority_when_the_stop_and_liquidation_cross_in_one_bar():
+    start = CUTOFF - HOUR_MS + QUARTER_MS
+    candles = {start: Bar(100, 101, 80, 99, 10)}
+    signal = {"time_ms": start, "side": 1, "atr": 1, "reference": 100}
+    baseline = simulate(candles, {}, 3, signal, STRESS, 1, max_leverage=10)
+    levered = simulate(candles, {}, 3, signal, STRESS, 1, leverage=5, max_leverage=10)
+    assert baseline["exit_reason"] == "stop"
+    assert levered["exit_reason"] == "liquidation_intrabar"
+    fee = levered["entry_notional"] * STRESS.taker_fee_bps / 10_000
+    assert levered["net"] == pytest.approx(-levered["collateral"] - fee)

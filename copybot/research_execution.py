@@ -136,6 +136,11 @@ def _before_stop(side, price, stop):
     return (price - stop) * side <= 0
 
 
+def isolated_liquidation_price(entry, side, leverage, maintenance_rate, funding_per_unit):
+    collateral_per_unit = entry / leverage + funding_per_unit
+    return (entry - side * collateral_per_unit) / (1 - side * maintenance_rate)
+
+
 def _through_limit(side, price, limit):
     return (price - limit) * side < 0
 
@@ -524,9 +529,9 @@ class _Replay:
 
     @staticmethod
     def liquidation_price(leg, funding):
-        side = leg.plan.side
-        collateral_per_unit = leg.entry / leg.leverage + funding / leg.size
-        return (leg.entry - side * collateral_per_unit) / (1 - side * leg.maintenance_rate)
+        return isolated_liquidation_price(
+            leg.entry, leg.plan.side, leg.leverage, leg.maintenance_rate, funding / leg.size
+        )
 
     def liquidated(self, leg, stamp, proxy, *, at_open):
         if leg.maintenance_rate is None:
